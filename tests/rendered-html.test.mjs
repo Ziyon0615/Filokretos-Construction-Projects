@@ -14,16 +14,16 @@ async function render() {
   );
 }
 
-test("server-renders the Filokreto dashboard", async () => {
+test("server-renders the Filokreto login", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
   assert.match(html, /<title>Filokreto \| Cost &amp; Margin Monitor<\/title>/i);
-  assert.match(html, /Australian operations/);
+  assert.match(html, /Welcome back/);
   assert.match(html, /Margin Intelligence/);
-  assert.match(html, /Scenario analysis/);
+  assert.match(html, /Demo workspace access/);
   assert.doesNotMatch(html, /codex-preview/);
 });
 

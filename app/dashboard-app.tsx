@@ -13,6 +13,9 @@ import {
 
 type View = "Overview" | "Projects" | "Trips & costs" | "Scenario analysis" | "Data quality";
 
+const demoEmail = "admin@filokreto.com";
+const demoPassword = "Demo2026!";
+
 const views: { label: View; icon: string }[] = [
   { label: "Overview", icon: "OV" },
   { label: "Projects", icon: "PR" },
@@ -47,6 +50,7 @@ function pct(value: number) {
 }
 
 export function DashboardApp() {
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [view, setView] = useState<View>("Overview");
   const [farm, setFarm] = useState<"All farms" | FarmName>("All farms");
   const [tripId, setTripId] = useState("All trips");
@@ -70,11 +74,15 @@ export function DashboardApp() {
     setTripId("All trips");
   }
 
+  if (!isAuthenticated) {
+    return <LoginScreen onLogin={() => setIsAuthenticated(true)} />;
+  }
+
   return (
     <div className="app-shell">
       <Sidebar active={view} onChange={setView} />
       <main className="main">
-        <Topbar onImport={() => setImportOpen(true)} onExport={() => exportReport(filteredSheds)} />
+        <Topbar onImport={() => setImportOpen(true)} onExport={() => exportReport(filteredSheds)} onLogout={() => setIsAuthenticated(false)} />
         <div className="content">
           <MobileTabs active={view} onChange={setView} />
           <PageHeading view={view}>
@@ -99,6 +107,62 @@ export function DashboardApp() {
       </main>
       {importOpen && <ImportModal onClose={() => setImportOpen(false)} />}
     </div>
+  );
+}
+
+function LoginScreen({ onLogin }: { onLogin: () => void }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [error, setError] = useState("");
+
+  function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (email.trim().toLowerCase() !== demoEmail || password !== demoPassword) {
+      setError("The email or password is incorrect. Use the demo access details below.");
+      return;
+    }
+    setError("");
+    onLogin();
+  }
+
+  function fillDemoAccount() {
+    setEmail(demoEmail);
+    setPassword(demoPassword);
+    setError("");
+  }
+
+  return (
+    <main className="login-shell">
+      <section className="login-showcase">
+        <div className="login-brand"><span className="brand-mark">FK</span><span><strong>Filokreto</strong><small>Margin Intelligence</small></span></div>
+        <div className="login-message"><p className="eyebrow">Australian operations</p><h1>Know the margin behind every build.</h1><p>One clear view of project revenue, crew trips, shared costs, and commercial performance.</p></div>
+        <div className="clay-scene" aria-hidden="true">
+          <div className="clay-window">
+            <div className="clay-window-top"><i /><i /><i /><span /></div>
+            <div className="clay-chart"><b /><b /><b /><b /></div>
+            <div className="clay-row"><i /><i /><i /><i /></div>
+          </div>
+          <div className="clay-tile clay-tile-purple"><span /><span /><span /><span /><span /><span /><span /><span /></div>
+          <div className="clay-tile clay-tile-blue"><div className="clay-switch"><i /></div><div className="clay-blocks"><i /><i /><i /></div></div>
+        </div>
+      </section>
+
+      <section className="login-form-side">
+        <form className="login-card" onSubmit={submit} noValidate>
+          <div className="login-card-heading"><span className="login-icon" aria-hidden="true">FK</span><p className="eyebrow">Secure workspace</p><h2>Welcome back</h2><p>Sign in to open the cost and margin monitor.</p></div>
+
+          <label className="login-field"><span>Email address</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="username" placeholder="name@filokreto.com" required /></label>
+          <label className="login-field"><span>Password</span><div className="password-field"><input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Enter your password" required /><button type="button" onClick={() => setShowPassword((visible) => !visible)} aria-label={showPassword ? "Hide password" : "Show password"}>{showPassword ? "Hide" : "Show"}</button></div></label>
+
+          {error && <p className="login-error" role="alert">{error}</p>}
+          <button className="login-submit" type="submit">Sign in to dashboard <span aria-hidden="true">→</span></button>
+
+          <div className="demo-access"><div><strong>Demo workspace access</strong><span>{demoEmail}<br />{demoPassword}</span></div><button type="button" onClick={fillDemoAccount}>Use demo</button></div>
+          <p className="login-security">Prototype access only. Connect a managed identity provider before production launch.</p>
+        </form>
+      </section>
+    </main>
   );
 }
 
@@ -127,7 +191,7 @@ function Sidebar({ active, onChange }: { active: View; onChange: (view: View) =>
   );
 }
 
-function Topbar({ onImport, onExport }: { onImport: () => void; onExport: () => void }) {
+function Topbar({ onImport, onExport, onLogout }: { onImport: () => void; onExport: () => void; onLogout: () => void }) {
   return (
     <header className="topbar">
       <div className="mobile-brand"><span className="brand-mark">FK</span>Filokreto</div>
@@ -135,7 +199,7 @@ function Topbar({ onImport, onExport }: { onImport: () => void; onExport: () => 
       <div className="top-actions">
         <button className="button secondary" type="button" onClick={onExport}>Export report</button>
         <button className="button primary" type="button" onClick={onImport}>Import data</button>
-        <div className="user-chip"><div className="avatar">FM</div><div className="user-copy"><strong>Filokreto Director</strong><span>Management access</span></div></div>
+        <button className="user-chip" type="button" onClick={onLogout} aria-label="Sign out"><div className="avatar">FM</div><div className="user-copy"><strong>Filokreto Director</strong><span>Sign out</span></div></button>
       </div>
     </header>
   );
