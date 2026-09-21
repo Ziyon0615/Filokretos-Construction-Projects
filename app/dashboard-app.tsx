@@ -21,6 +21,14 @@ const views: { label: View; icon: string }[] = [
   { label: "Data quality", icon: "DQ" },
 ];
 
+const sourceTemplates: Record<string, string[]> = {
+  "Shed master": ["Shed_ID", "Farm", "Trip_ID", "Area_sqm", "Direct_Floor_Cost", "Contract_Revenue", "Completion_Date"],
+  "Trip log": ["Trip_ID", "Farm", "Start_Date", "End_Date", "Sheds_Completed", "Flight_Cost", "Accommodation", "Food_Allowance", "Vehicle_Cost"],
+  "NZ invoices": ["Invoice_ID", "Invoice_Month", "Trip_ID", "Labour_Cost_NZD", "Other_Expenses_NZD", "Total_NZD"],
+  "AU Xero costs": ["Date", "Reference_ID", "Trip_ID", "Farm", "Category", "Amount_AUD"],
+  "FX rates": ["Month", "NZD_to_AUD_Rate"],
+};
+
 const aud = new Intl.NumberFormat("en-AU", {
   style: "currency",
   currency: "AUD",
@@ -184,14 +192,14 @@ function Overview({ records }: { records: typeof sheds }) {
   return (
     <>
       <div className="metrics-grid">
-        <Metric label="Contract revenue" value={compactAud.format(model.revenue)} note={`${records.length} completed floor units`} delta="GST exclusive" accent="#2b8064" />
-        <Metric label="Total cost" value={compactAud.format(model.totalCost)} note={`${pct(directShare)} direct floor cost`} delta="AUD normalized" accent="#edae49" />
+        <Metric label="Contract revenue" value={compactAud.format(model.revenue)} note={`${records.length} completed floor units`} delta="GST exclusive" accent="#f47a1f" />
+        <Metric label="Total cost" value={compactAud.format(model.totalCost)} note={`${pct(directShare)} direct floor cost`} delta="AUD normalized" accent="#2a2725" />
         <Metric label="Gross margin" value={pct(model.marginPct)} note={`${compactAud.format(model.margin)} contribution`} delta={`${Math.abs(model.marginPct - 50).toFixed(1)} pts below target`} warning accent="#d85d4c" />
-        <Metric label="Cost per shed" value={compactAud.format(model.totalCost / records.length)} note={`${compactAud.format(model.logistics / records.length)} shared costs`} delta="Allocated by trip" accent="#758b7f" />
+        <Metric label="Cost per shed" value={compactAud.format(model.totalCost / records.length)} note={`${compactAud.format(model.logistics / records.length)} shared costs`} delta="Allocated by trip" accent="#9a8c82" />
       </div>
       <div className="overview-grid">
         <section className="panel">
-          <div className="panel-header"><div><h2>Margin by farm</h2><p>Gross margin after allocated logistics and labour</p></div><div className="legend"><span style={{ "--legend-color": "#215342" } as React.CSSProperties}>Actual</span><span style={{ "--legend-color": "#edae49" } as React.CSSProperties}>50% target</span></div></div>
+          <div className="panel-header"><div><h2>Margin by farm</h2><p>Gross margin after allocated logistics and labour</p></div><div className="legend"><span style={{ "--legend-color": "#f47a1f" } as React.CSSProperties}>Actual</span><span style={{ "--legend-color": "#2a2725" } as React.CSSProperties}>50% target</span></div></div>
           <div className="farm-chart">
             {farmRows.map((row) => (
               <div className="farm-row" key={row.name}>
@@ -328,12 +336,17 @@ function ImportModal({ onClose }: { onClose: () => void }) {
   const [source, setSource] = useState("Shed master");
   const [fileName, setFileName] = useState("");
   const [staged, setStaged] = useState(false);
+  const [copied, setCopied] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const sources = [["Shed master", "Revenue and direct costs"], ["Trip log", "Flights, labour and allowances"], ["NZ invoices", "Intercompany NZD records"], ["AU Xero costs", "Australian-side expenses"], ["FX rates", "Monthly conversion rates"]];
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><div className="modal-header"><div><h2 id="import-title">Import source data</h2><p>Select the dataset, then attach its latest Excel or CSV export.</p></div><button className="close-button" type="button" onClick={onClose} aria-label="Close import dialog">×</button></div>
-        <div className="modal-body"><div className="source-grid">{sources.map(([title, description]) => <button className={`source-option ${source === title ? "selected" : ""}`} type="button" key={title} onClick={() => setSource(title)}><strong>{title}</strong><span>{description}</span></button>)}</div>
+        <div className="modal-body"><div className="source-grid">{sources.map(([title, description]) => <button className={`source-option ${source === title ? "selected" : ""}`} type="button" key={title} onClick={() => { setSource(title); setCopied(false); }}><strong>{title}</strong><span>{description}</span></button>)}</div>
+          <div className="template-guide">
+            <div className="template-guide-head"><div><strong>Excel template columns</strong><span>Paste these headers into row 1 without renaming them.</span></div><button className="button template-button" type="button" onClick={async () => { await navigator.clipboard.writeText(sourceTemplates[source].join("\t")); setCopied(true); }}>{copied ? "Headers copied" : "Copy headers"}</button></div>
+            <div className="column-chips">{sourceTemplates[source].map((column) => <code key={column}>{column}</code>)}</div>
+          </div>
           <div className="drop-zone"><strong>{source} file</strong><span>Accepted formats: .xlsx and .csv</span><input ref={fileRef} type="file" accept=".xlsx,.csv" hidden onChange={(event) => { setFileName(event.target.files?.[0]?.name ?? ""); setStaged(false); }} /><button className="button secondary" type="button" onClick={() => fileRef.current?.click()}>Choose file</button>{fileName && <div className="file-name">Ready to validate: {fileName}</div>}{fileName && <button className="button primary import-action" type="button" onClick={() => setStaged(true)}>Stage for validation</button>}{staged && <div className="staged-note">File staged. Persistent import processing will be connected to the approved database.</div>}</div>
         </div>
       </section>
