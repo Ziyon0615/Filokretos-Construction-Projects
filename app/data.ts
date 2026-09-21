@@ -80,8 +80,8 @@ export function allocatedTripCost(trip: Trip) {
   return tripCost(trip) / trip.batchSize;
 }
 
-export function shedEconomics(shed: Shed) {
-  const trip = trips.find((item) => item.id === shed.tripId);
+export function shedEconomics(shed: Shed, tripRecords: Trip[] = trips) {
+  const trip = tripRecords.find((item) => item.id === shed.tripId);
   const logistics = trip ? allocatedTripCost(trip) : 0;
   const totalCost = shed.directCost + logistics;
   const margin = shed.revenue - totalCost;

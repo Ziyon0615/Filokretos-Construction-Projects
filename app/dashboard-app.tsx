@@ -1,20 +1,23 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   allocatedTripCost,
   farmNames,
   shedEconomics,
-  sheds,
+  sheds as demoSheds,
   tripCost,
-  trips,
+  trips as demoTrips,
   type FarmName,
+  type Shed,
+  type Trip,
 } from "./data";
 
 type View = "Overview" | "Projects" | "Trips & costs" | "Scenario analysis" | "Data quality";
 
 const demoEmail = "admin@filokreto.com";
 const demoPassword = "Demo2026!";
+const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 
 const views: { label: View; icon: string }[] = [
   { label: "Overview", icon: "OV" },
@@ -56,17 +59,35 @@ export function DashboardApp() {
   const [tripId, setTripId] = useState("All trips");
   const [period, setPeriod] = useState("All time");
   const [importOpen, setImportOpen] = useState(false);
+  const [shedRecords, setShedRecords] = useState<Shed[]>(demoSheds);
+  const [tripRecords, setTripRecords] = useState<Trip[]>(demoTrips);
+
+  useEffect(() => {
+    let active = true;
+    fetch(`${apiUrl}/api/auth/session`, { credentials: "include" })
+      .then(async (response) => {
+        if (!active || !response.ok) return;
+        setIsAuthenticated(true);
+        const dashboardResponse = await fetch(`${apiUrl}/api/dashboard`, { credentials: "include" });
+        if (!active || !dashboardResponse.ok) return;
+        const data = await dashboardResponse.json() as { sheds: Shed[]; trips: Trip[] };
+        setShedRecords(data.sheds);
+        setTripRecords(data.trips);
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, []);
 
   const availableTrips = useMemo(
-    () => trips.filter((trip) => farm === "All farms" || trip.farm === farm),
-    [farm],
+    () => tripRecords.filter((trip) => farm === "All farms" || trip.farm === farm),
+    [farm, tripRecords],
   );
   const filteredSheds = useMemo(
-    () => sheds.filter((shed) =>
+    () => shedRecords.filter((shed) =>
       (farm === "All farms" || shed.farm === farm) &&
       (tripId === "All trips" || shed.tripId === tripId) &&
       (period === "All time" || shed.completionDate.startsWith(period))),
-    [farm, tripId, period],
+    [farm, period, shedRecords, tripId],
   );
 
   function changeFarm(value: "All farms" | FarmName) {
@@ -74,15 +95,46 @@ export function DashboardApp() {
     setTripId("All trips");
   }
 
+  async function login(email: string, password: string) {
+    try {
+      const response = await fetch(`${apiUrl}/api/auth/login`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      if (!response.ok) return response.status === 401 ? "The email or password is incorrect." : "The login service could not complete the request.";
+      const dashboardResponse = await fetch(`${apiUrl}/api/dashboard`, { credentials: "include" });
+      if (dashboardResponse.ok) {
+        const data = await dashboardResponse.json() as { sheds: Shed[]; trips: Trip[] };
+        setShedRecords(data.sheds);
+        setTripRecords(data.trips);
+      }
+      setIsAuthenticated(true);
+      return null;
+    } catch {
+      return "Cannot reach the local login service. Make sure the application is running with npm run dev.";
+    }
+  }
+
+  async function logout() {
+    try {
+      await fetch(`${apiUrl}/api/auth/logout`, { method: "POST", credentials: "include" });
+    } finally {
+      setImportOpen(false);
+      setIsAuthenticated(false);
+    }
+  }
+
   if (!isAuthenticated) {
-    return <LoginScreen onLogin={() => setIsAuthenticated(true)} />;
+    return <LoginScreen onLogin={login} />;
   }
 
   return (
     <div className="app-shell">
       <Sidebar active={view} onChange={setView} />
       <main className="main">
-        <Topbar onImport={() => setImportOpen(true)} onExport={() => exportReport(filteredSheds)} onLogout={() => setIsAuthenticated(false)} />
+        <Topbar onImport={() => setImportOpen(true)} onExport={() => exportReport(filteredSheds, tripRecords)} onLogout={logout} />
         <div className="content">
           <MobileTabs active={view} onChange={setView} />
           <PageHeading view={view}>
@@ -98,9 +150,9 @@ export function DashboardApp() {
               />
             )}
           </PageHeading>
-          {view === "Overview" && <Overview records={filteredSheds} />}
-          {view === "Projects" && <Projects records={filteredSheds} />}
-          {view === "Trips & costs" && <TripsAndCosts farm={farm} selectedTrip={tripId} />}
+          {view === "Overview" && <Overview records={filteredSheds} tripRecords={tripRecords} />}
+          {view === "Projects" && <Projects records={filteredSheds} tripRecords={tripRecords} />}
+          {view === "Trips & costs" && <TripsAndCosts farm={farm} selectedTrip={tripId} tripRecords={tripRecords} />}
           {view === "Scenario analysis" && <ScenarioAnalysis />}
           {view === "Data quality" && <DataQuality />}
         </div>
@@ -110,20 +162,23 @@ export function DashboardApp() {
   );
 }
 
-function LoginScreen({ onLogin }: { onLogin: () => void }) {
+function LoginScreen({ onLogin }: { onLogin: (email: string, password: string) => Promise<string | null> }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
-  function submit(event: React.FormEvent<HTMLFormElement>) {
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (email.trim().toLowerCase() !== demoEmail || password !== demoPassword) {
-      setError("The email or password is incorrect. Use the demo access details below.");
+    if (!email.trim() || !password) {
+      setError("Enter your email address and password.");
       return;
     }
-    setError("");
-    onLogin();
+    setSubmitting(true);
+    const loginError = await onLogin(email.trim(), password);
+    setSubmitting(false);
+    setError(loginError ?? "");
   }
 
   function fillDemoAccount() {
@@ -156,7 +211,7 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
           <label className="login-field"><span>Password</span><div className="password-field"><input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="Enter your password" required /><button type="button" onClick={() => setShowPassword((visible) => !visible)} aria-label={showPassword ? "Hide password" : "Show password"}>{showPassword ? "Hide" : "Show"}</button></div></label>
 
           {error && <p className="login-error" role="alert">{error}</p>}
-          <button className="login-submit" type="submit">Sign in to dashboard <span aria-hidden="true">→</span></button>
+          <button className="login-submit" type="submit" disabled={submitting}>{submitting ? "Signing in…" : "Sign in to dashboard"} <span aria-hidden="true">→</span></button>
 
           <div className="demo-access"><div><strong>Demo workspace access</strong><span>{demoEmail}<br />{demoPassword}</span></div><button type="button" onClick={fillDemoAccount}>Use demo</button></div>
           <p className="login-security">Prototype access only. Connect a managed identity provider before production launch.</p>
@@ -184,7 +239,7 @@ function Sidebar({ active, onChange }: { active: View; onChange: (view: View) =>
       <div className="sidebar-foot">
         <div className="sync-card">
           <div className="sync-row"><span>System ready</span><span className="status-dot" aria-hidden="true" /></div>
-          <p>Illustrative project data<br />Last model refresh: 21 Sep 2026</p>
+          <p>Local SQLite database<br />Authenticated project records</p>
         </div>
       </div>
     </aside>
@@ -233,7 +288,7 @@ function Filters({ farm, tripId, period, availableTrips, onFarmChange, onTripCha
   farm: "All farms" | FarmName;
   tripId: string;
   period: string;
-  availableTrips: typeof trips;
+  availableTrips: Trip[];
   onFarmChange: (value: "All farms" | FarmName) => void;
   onTripChange: (value: string) => void;
   onPeriodChange: (value: string) => void;
@@ -247,9 +302,9 @@ function Filters({ farm, tripId, period, availableTrips, onFarmChange, onTripCha
   );
 }
 
-function Overview({ records }: { records: typeof sheds }) {
-  const model = useMemo(() => summarize(records), [records]);
-  const farmRows = useMemo(() => Array.from(new Set(records.map((record) => record.farm))).map((name) => ({ name, ...summarize(records.filter((item) => item.farm === name)) })), [records]);
+function Overview({ records, tripRecords }: { records: Shed[]; tripRecords: Trip[] }) {
+  const model = useMemo(() => summarize(records, tripRecords), [records, tripRecords]);
+  const farmRows = useMemo(() => Array.from(new Set(records.map((record) => record.farm))).map((name) => ({ name, ...summarize(records.filter((item) => item.farm === name), tripRecords) })), [records, tripRecords]);
   if (!records.length) return <div className="panel empty-note">No records match the selected filters.</div>;
   const directShare = model.totalCost ? (model.directCost / model.totalCost) * 100 : 0;
 
@@ -286,7 +341,7 @@ function Overview({ records }: { records: typeof sheds }) {
           </div>
         </section>
       </div>
-      <ProjectTable records={records.slice(0, 7)} title="Recent completed sheds" subtitle="Per-shed cost and margin after trip allocation" />
+      <ProjectTable records={records.slice(0, 7)} tripRecords={tripRecords} title="Recent completed sheds" subtitle="Per-shed cost and margin after trip allocation" />
     </>
   );
 }
@@ -295,10 +350,10 @@ function Metric({ label, value, note, delta, warning, accent }: { label: string;
   return <article className="metric-card" style={{ "--accent": accent } as React.CSSProperties}><div className="metric-top"><span>{label}</span><span className={`delta ${warning ? "warn" : ""}`}>{delta}</span></div><div className="metric-value">{value}</div><div className="metric-note">{note}</div></article>;
 }
 
-function Projects({ records }: { records: typeof sheds }) {
+function Projects({ records, tripRecords }: { records: Shed[]; tripRecords: Trip[] }) {
   const [query, setQuery] = useState("");
   const visible = records.filter((record) => `${record.id} ${record.farm} ${record.tripId}`.toLowerCase().includes(query.toLowerCase()));
-  const totals = summarize(records);
+  const totals = summarize(records, tripRecords);
   return (
     <>
       <div className="project-summary">
@@ -307,30 +362,30 @@ function Projects({ records }: { records: typeof sheds }) {
         <div className="summary-item"><span>Total area</span><strong>{Math.round(records.reduce((sum, item) => sum + item.areaSqm, 0) / 1000)}k m²</strong></div>
         <div className="summary-item"><span>Margin</span><strong>{pct(totals.marginPct)}</strong></div>
       </div>
-      <div className="panel table-panel"><div className="panel-header"><div><h2>Project register</h2><p>{visible.length} matching records</p></div><input className="search-input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search shed or trip" aria-label="Search projects" /></div><ProjectRows records={visible} /></div>
+      <div className="panel table-panel"><div className="panel-header"><div><h2>Project register</h2><p>{visible.length} matching records</p></div><input className="search-input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search shed or trip" aria-label="Search projects" /></div><ProjectRows records={visible} tripRecords={tripRecords} /></div>
     </>
   );
 }
 
-function ProjectTable({ records, title, subtitle }: { records: typeof sheds; title: string; subtitle: string }) {
-  return <section className="panel table-panel"><div className="panel-header"><div><h2>{title}</h2><p>{subtitle}</p></div><span className="delta">Illustrative data</span></div><ProjectRows records={records} /></section>;
+function ProjectTable({ records, tripRecords, title, subtitle }: { records: Shed[]; tripRecords: Trip[]; title: string; subtitle: string }) {
+  return <section className="panel table-panel"><div className="panel-header"><div><h2>{title}</h2><p>{subtitle}</p></div><span className="delta">SQLite data</span></div><ProjectRows records={records} tripRecords={tripRecords} /></section>;
 }
 
-function ProjectRows({ records }: { records: typeof sheds }) {
+function ProjectRows({ records, tripRecords }: { records: Shed[]; tripRecords: Trip[] }) {
   if (!records.length) return <div className="empty-note">No project records found.</div>;
   return (
     <div className="data-table-wrap"><table className="data-table">
       <thead><tr><th>Shed</th><th>Farm</th><th>Trip</th><th>Revenue</th><th>Total cost</th><th>Margin</th><th>Status</th></tr></thead>
       <tbody>{records.map((shed) => {
-        const economics = shedEconomics(shed);
+        const economics = shedEconomics(shed, tripRecords);
         return <tr key={shed.id}><td className="id-cell">{shed.id}<span className="sub-cell">{shed.areaSqm.toLocaleString()} m²</span></td><td>{shed.farm}</td><td>{shed.tripId}</td><td>{aud.format(shed.revenue)}</td><td>{aud.format(economics.totalCost)}</td><td><span className={`margin-pill ${economics.marginPct >= 50 ? "good" : "low"}`}>{pct(economics.marginPct)}</span></td><td><span className="status-pill complete">Complete</span></td></tr>;
       })}</tbody>
     </table></div>
   );
 }
 
-function TripsAndCosts({ farm, selectedTrip }: { farm: "All farms" | FarmName; selectedTrip: string }) {
-  const visibleTrips = trips.filter((trip) => (farm === "All farms" || trip.farm === farm) && (selectedTrip === "All trips" || trip.id === selectedTrip));
+function TripsAndCosts({ farm, selectedTrip, tripRecords }: { farm: "All farms" | FarmName; selectedTrip: string; tripRecords: Trip[] }) {
+  const visibleTrips = tripRecords.filter((trip) => (farm === "All farms" || trip.farm === farm) && (selectedTrip === "All trips" || trip.id === selectedTrip));
   const total = visibleTrips.reduce((sum, trip) => sum + tripCost(trip), 0);
   const components = [
     ["NZ labour", visibleTrips.reduce((sum, item) => sum + item.nzLabour, 0)],
@@ -418,9 +473,9 @@ function ImportModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function summarize(records: typeof sheds) {
+function summarize(records: Shed[], tripRecords: Trip[]) {
   return records.reduce((summary, shed) => {
-    const economics = shedEconomics(shed);
+    const economics = shedEconomics(shed, tripRecords);
     summary.count += 1;
     summary.revenue += shed.revenue;
     summary.directCost += shed.directCost;
@@ -436,10 +491,10 @@ function formatDate(value: string) {
   return new Intl.DateTimeFormat("en-AU", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`));
 }
 
-function exportReport(records: typeof sheds) {
+function exportReport(records: Shed[], tripRecords: Trip[]) {
   const header = ["Shed ID", "Farm", "Trip ID", "Area sqm", "Revenue AUD", "Direct Cost AUD", "Allocated Trip Cost AUD", "Total Cost AUD", "Margin AUD", "Margin Percent"];
   const rows = records.map((shed) => {
-    const economics = shedEconomics(shed);
+    const economics = shedEconomics(shed, tripRecords);
     return [shed.id, shed.farm, shed.tripId, shed.areaSqm, shed.revenue, shed.directCost, economics.logistics.toFixed(2), economics.totalCost.toFixed(2), economics.margin.toFixed(2), economics.marginPct.toFixed(2)];
   });
   const csv = [header, ...rows].map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(",")).join("\n");
