@@ -192,14 +192,14 @@ function Overview({ records }: { records: typeof sheds }) {
   return (
     <>
       <div className="metrics-grid">
-        <Metric label="Contract revenue" value={compactAud.format(model.revenue)} note={`${records.length} completed floor units`} delta="GST exclusive" accent="#f47a1f" />
-        <Metric label="Total cost" value={compactAud.format(model.totalCost)} note={`${pct(directShare)} direct floor cost`} delta="AUD normalized" accent="#2a2725" />
-        <Metric label="Gross margin" value={pct(model.marginPct)} note={`${compactAud.format(model.margin)} contribution`} delta={`${Math.abs(model.marginPct - 50).toFixed(1)} pts below target`} warning accent="#d85d4c" />
-        <Metric label="Cost per shed" value={compactAud.format(model.totalCost / records.length)} note={`${compactAud.format(model.logistics / records.length)} shared costs`} delta="Allocated by trip" accent="#9a8c82" />
+        <Metric label="Contract revenue" value={compactAud.format(model.revenue)} note={`${records.length} completed floor units`} delta="GST exclusive" accent="#3b86e8" />
+        <Metric label="Total cost" value={compactAud.format(model.totalCost)} note={`${pct(directShare)} direct floor cost`} delta="AUD normalized" accent="#7a5be7" />
+        <Metric label="Gross margin" value={pct(model.marginPct)} note={`${compactAud.format(model.margin)} contribution`} delta={`${Math.abs(model.marginPct - 50).toFixed(1)} pts below target`} warning accent="#ff8d73" />
+        <Metric label="Cost per shed" value={compactAud.format(model.totalCost / records.length)} note={`${compactAud.format(model.logistics / records.length)} shared costs`} delta="Allocated by trip" accent="#68cfa8" />
       </div>
       <div className="overview-grid">
         <section className="panel">
-          <div className="panel-header"><div><h2>Margin by farm</h2><p>Gross margin after allocated logistics and labour</p></div><div className="legend"><span style={{ "--legend-color": "#f47a1f" } as React.CSSProperties}>Actual</span><span style={{ "--legend-color": "#2a2725" } as React.CSSProperties}>50% target</span></div></div>
+          <div className="panel-header"><div><h2>Margin by farm</h2><p>Gross margin after allocated logistics and labour</p></div><div className="legend"><span style={{ "--legend-color": "#3b86e8" } as React.CSSProperties}>Actual</span><span style={{ "--legend-color": "#ff8d73" } as React.CSSProperties}>50% target</span></div></div>
           <div className="farm-chart">
             {farmRows.map((row) => (
               <div className="farm-row" key={row.name}>
