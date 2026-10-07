@@ -1,17 +1,18 @@
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
-import { mkdirSync } from "node:fs";
 import { createServer } from "node:http";
-import { dirname, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { Readable } from "node:stream";
 import ExcelJS from "exceljs";
+import { closeDatabase, initializeDatabase, pool } from "./database.mjs";
 
 const port = Number(process.env.PORT ?? 4000);
-const databasePath = resolve(process.env.DATABASE_PATH ?? "backend/data/filokreto.db");
 const sessionHours = Number(process.env.SESSION_HOURS ?? 8);
 const allowedOrigins = new Set((process.env.FRONTEND_ORIGIN ?? "http://localhost:3000").split(",").map((value) => value.trim()).filter(Boolean));
 const cookieSecure = process.env.COOKIE_SECURE === "true";
 const cookieSameSite = process.env.COOKIE_SAME_SITE ?? "Lax";
+const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+const adminPassword = process.env.ADMIN_PASSWORD ?? "";
+const adminDisplayName = process.env.ADMIN_DISPLAY_NAME?.trim() || "Filokreto Director";
+const seedDemoData = process.env.SEED_DEMO_DATA === "true";
 
 const importSources = {
   "shed-master": { name: "Shed master", columns: ["Shed_ID", "Farm", "Trip_ID", "Area_sqm", "Direct_Floor_Cost", "Contract_Revenue", "Completion_Date"] },
@@ -20,69 +21,6 @@ const importSources = {
   "au-xero-costs": { name: "AU Xero costs", columns: ["Date", "Reference_ID", "Trip_ID", "Farm", "Category", "Amount_AUD"] },
   "fx-rates": { name: "FX rates", columns: ["Month", "NZD_to_AUD_Rate"] },
 };
-
-mkdirSync(dirname(databasePath), { recursive: true });
-const db = new DatabaseSync(databasePath);
-db.exec("PRAGMA foreign_keys = ON");
-db.exec("PRAGMA journal_mode = WAL");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL UNIQUE,
-    display_name TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'director',
-    password_hash TEXT NOT NULL,
-    password_salt TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_hash TEXT NOT NULL UNIQUE,
-    expires_at TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS trips (
-    id TEXT PRIMARY KEY,
-    farm TEXT NOT NULL,
-    start_date TEXT NOT NULL,
-    end_date TEXT NOT NULL,
-    batch_size INTEGER NOT NULL CHECK (batch_size > 0),
-    flight_cost_cents INTEGER NOT NULL,
-    accommodation_cents INTEGER NOT NULL,
-    allowance_cents INTEGER NOT NULL,
-    nz_labour_cents INTEGER NOT NULL,
-    au_cost_cents INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS sheds (
-    id TEXT PRIMARY KEY,
-    farm TEXT NOT NULL,
-    trip_id TEXT NOT NULL REFERENCES trips(id),
-    area_sqm REAL NOT NULL,
-    direct_cost_cents INTEGER NOT NULL,
-    revenue_cents INTEGER NOT NULL,
-    completion_date TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'Complete'
-  );
-  CREATE TABLE IF NOT EXISTS import_batches (
-    id TEXT PRIMARY KEY,
-    source TEXT NOT NULL,
-    filename TEXT NOT NULL,
-    row_count INTEGER NOT NULL,
-    imported_by INTEGER NOT NULL REFERENCES users(id),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS import_rows (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id TEXT NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
-    row_number INTEGER NOT NULL,
-    data_json TEXT NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS sessions_token_hash_idx ON sessions(token_hash);
-  CREATE INDEX IF NOT EXISTS sheds_farm_idx ON sheds(farm);
-  CREATE INDEX IF NOT EXISTS sheds_trip_id_idx ON sheds(trip_id);
-`);
 
 const demoTrips = [
   ["MF2-01", "Meriki Farm 2", "2024-03-04", "2024-03-14", 4, 4200, 3450, 1900, 16300, 5400],
@@ -114,43 +52,51 @@ function hashToken(token) {
   return createHash("sha256").update(token).digest("hex");
 }
 
-function seedDatabase() {
-  const existingUser = db.prepare("SELECT id FROM users WHERE email = ?").get("admin@filokreto.com");
-  if (!existingUser) {
-    const salt = randomBytes(16).toString("hex");
-    db.prepare("INSERT INTO users (email, display_name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?)")
-      .run("admin@filokreto.com", "Filokreto Director", "director", hashPassword("Demo2026!", salt), salt);
+async function seedDatabase() {
+  if (!adminEmail || !/^\S+@\S+\.\S+$/.test(adminEmail)) {
+    throw new Error("ADMIN_EMAIL is required and must be a valid email address.");
+  }
+  if (adminPassword.length < 12) {
+    throw new Error("ADMIN_PASSWORD is required and must contain at least 12 characters.");
   }
 
-  const tripCount = db.prepare("SELECT COUNT(*) AS count FROM trips").get().count;
-  if (tripCount > 0) return;
+  const salt = randomBytes(16).toString("hex");
+  await pool.query(`INSERT INTO users (email, display_name, role, password_hash, password_salt)
+    VALUES ($1, $2, 'director', $3, $4)
+    ON CONFLICT (email) DO UPDATE SET display_name = EXCLUDED.display_name, role = EXCLUDED.role,
+      password_hash = EXCLUDED.password_hash, password_salt = EXCLUDED.password_salt`,
+  [adminEmail, adminDisplayName, hashPassword(adminPassword, salt), salt]);
 
-  const insertTrip = db.prepare(`INSERT INTO trips (id, farm, start_date, end_date, batch_size, flight_cost_cents, accommodation_cents, allowance_cents, nz_labour_cents, au_cost_cents)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  const insertShed = db.prepare(`INSERT INTO sheds (id, farm, trip_id, area_sqm, direct_cost_cents, revenue_cents, completion_date, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'Complete')`);
+  if (!seedDemoData) return;
+  const { rows: countRows } = await pool.query("SELECT COUNT(*) AS count FROM trips");
+  if (Number(countRows[0].count) > 0) return;
 
-  db.exec("BEGIN");
+  const client = await pool.connect();
+  await client.query("BEGIN");
   try {
     for (const trip of demoTrips) {
       const [id, farm, startDate, endDate, batchSize, flight, accommodation, allowance, nzLabour, auCost] = trip;
-      insertTrip.run(id, farm, startDate, endDate, batchSize, flight * 100, accommodation * 100, allowance * 100, nzLabour * 100, auCost * 100);
+      await client.query(`INSERT INTO trips (id, farm, start_date, end_date, batch_size, flight_cost_cents, accommodation_cents, allowance_cents, nz_labour_cents, au_cost_cents)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [id, farm, startDate, endDate, batchSize, flight * 100, accommodation * 100, allowance * 100, nzLabour * 100, auCost * 100]);
       const base = farmEconomics[farm];
       for (let index = 0; index < batchSize; index += 1) {
         const sequence = index + 1;
         const revenue = base.revenue + ((index % 4) - 1.5) * 620;
         const directCost = base.direct + ((index % 3) - 1) * 410;
-        insertShed.run(`${id}-S${String(sequence).padStart(2, "0")}`, farm, id, base.area + index * 18, Math.round(directCost * 100), Math.round(revenue * 100), endDate);
+        await client.query(`INSERT INTO sheds (id, farm, trip_id, area_sqm, direct_cost_cents, revenue_cents, completion_date, status)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 'Complete')`,
+        [`${id}-S${String(sequence).padStart(2, "0")}`, farm, id, base.area + index * 18, Math.round(directCost * 100), Math.round(revenue * 100), endDate]);
       }
     }
-    db.exec("COMMIT");
+    await client.query("COMMIT");
   } catch (error) {
-    db.exec("ROLLBACK");
+    await client.query("ROLLBACK");
     throw error;
+  } finally {
+    client.release();
   }
 }
-
-seedDatabase();
 
 function setCors(request, response) {
   const origin = request.headers.origin;
@@ -200,13 +146,15 @@ function cookieValue(request, name) {
   return null;
 }
 
-function sessionUser(request) {
+async function sessionUser(request) {
   const token = cookieValue(request, "filokreto_session");
   if (!token) return null;
-  db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(new Date().toISOString());
-  return db.prepare(`SELECT users.id, users.email, users.display_name AS displayName, users.role
+  const now = new Date().toISOString();
+  await pool.query("DELETE FROM sessions WHERE expires_at <= $1", [now]);
+  const { rows } = await pool.query(`SELECT users.id, users.email, users.display_name AS "displayName", users.role
     FROM sessions JOIN users ON users.id = sessions.user_id
-    WHERE sessions.token_hash = ? AND sessions.expires_at > ?`).get(hashToken(token), new Date().toISOString()) ?? null;
+    WHERE sessions.token_hash = $1 AND sessions.expires_at > $2`, [hashToken(token), now]);
+  return rows[0] ?? null;
 }
 
 function sessionCookie(token, maxAge) {
@@ -311,23 +259,23 @@ async function createMarginReport({ farm, tripId, period }) {
   const conditions = [];
   const parameters = [];
   if (farm) {
-    conditions.push("sheds.farm = ?");
     parameters.push(farm);
+    conditions.push(`sheds.farm = $${parameters.length}`);
   }
   if (tripId) {
-    conditions.push("sheds.trip_id = ?");
     parameters.push(tripId);
+    conditions.push(`sheds.trip_id = $${parameters.length}`);
   }
   if (period) {
-    conditions.push("sheds.completion_date LIKE ?");
     parameters.push(`${period}-%`);
+    conditions.push(`sheds.completion_date LIKE $${parameters.length}`);
   }
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const rows = db.prepare(`SELECT sheds.*, trips.batch_size, trips.flight_cost_cents, trips.accommodation_cents,
+  const { rows } = await pool.query(`SELECT sheds.*, trips.batch_size, trips.flight_cost_cents, trips.accommodation_cents,
       trips.allowance_cents, trips.nz_labour_cents, trips.au_cost_cents
     FROM sheds JOIN trips ON trips.id = sheds.trip_id
     ${where}
-    ORDER BY sheds.completion_date DESC, sheds.id`).all(...parameters);
+    ORDER BY sheds.completion_date DESC, sheds.id`, parameters);
 
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "Filokreto Cost & Margin Monitor";
@@ -382,50 +330,49 @@ async function createMarginReport({ farm, tripId, period }) {
   return workbook.xlsx.writeBuffer();
 }
 
-function importRows(sourceKey, source, filename, rows, user) {
+async function importRows(sourceKey, source, filename, rows, user) {
   const batchId = randomUUID();
-  const insertImportRow = db.prepare("INSERT INTO import_rows (batch_id, row_number, data_json) VALUES (?, ?, ?)");
-  const upsertTrip = db.prepare(`INSERT INTO trips (id, farm, start_date, end_date, batch_size, flight_cost_cents, accommodation_cents, allowance_cents, nz_labour_cents, au_cost_cents)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-    ON CONFLICT(id) DO UPDATE SET farm=excluded.farm, start_date=excluded.start_date, end_date=excluded.end_date, batch_size=excluded.batch_size,
-      flight_cost_cents=excluded.flight_cost_cents, accommodation_cents=excluded.accommodation_cents, allowance_cents=excluded.allowance_cents, au_cost_cents=excluded.au_cost_cents`);
-  const upsertShed = db.prepare(`INSERT INTO sheds (id, farm, trip_id, area_sqm, direct_cost_cents, revenue_cents, completion_date, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'Complete')
-    ON CONFLICT(id) DO UPDATE SET farm=excluded.farm, trip_id=excluded.trip_id, area_sqm=excluded.area_sqm, direct_cost_cents=excluded.direct_cost_cents,
-      revenue_cents=excluded.revenue_cents, completion_date=excluded.completion_date, status='Complete'`);
-
-  db.exec("BEGIN");
+  const client = await pool.connect();
+  await client.query("BEGIN");
   try {
-    db.prepare("INSERT INTO import_batches (id, source, filename, row_count, imported_by) VALUES (?, ?, ?, ?, ?)").run(batchId, source.name, filename, rows.length, user.id);
+    await client.query("INSERT INTO import_batches (id, source, filename, row_count, imported_by) VALUES ($1, $2, $3, $4, $5)", [batchId, source.name, filename, rows.length, user.id]);
     for (const { rowNumber, record } of rows) {
       if (sourceKey === "trip-log") {
         const startDate = requiredDate(record, "Start_Date", rowNumber);
         const endDate = requiredDate(record, "End_Date", rowNumber);
         if (endDate < startDate) throw new ValidationError(`Row ${rowNumber}: End_Date cannot be before Start_Date.`);
-        upsertTrip.run(
+        await client.query(`INSERT INTO trips (id, farm, start_date, end_date, batch_size, flight_cost_cents, accommodation_cents, allowance_cents, nz_labour_cents, au_cost_cents)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9)
+          ON CONFLICT(id) DO UPDATE SET farm=EXCLUDED.farm, start_date=EXCLUDED.start_date, end_date=EXCLUDED.end_date, batch_size=EXCLUDED.batch_size,
+            flight_cost_cents=EXCLUDED.flight_cost_cents, accommodation_cents=EXCLUDED.accommodation_cents, allowance_cents=EXCLUDED.allowance_cents, au_cost_cents=EXCLUDED.au_cost_cents`, [
           requiredText(record, "Trip_ID", rowNumber), requiredText(record, "Farm", rowNumber), startDate,
           endDate, requiredNumber(record, "Sheds_Completed", rowNumber, { positive: true, integer: true }),
           Math.round(requiredNumber(record, "Flight_Cost", rowNumber, { nonNegative: true }) * 100), Math.round(requiredNumber(record, "Accommodation", rowNumber, { nonNegative: true }) * 100),
           Math.round(requiredNumber(record, "Food_Allowance", rowNumber, { nonNegative: true }) * 100), Math.round(requiredNumber(record, "Vehicle_Cost", rowNumber, { nonNegative: true }) * 100),
-        );
+        ]);
       }
       if (sourceKey === "shed-master") {
         const tripId = requiredText(record, "Trip_ID", rowNumber);
-        const trip = db.prepare("SELECT id, farm FROM trips WHERE id = ?").get(tripId);
+        const { rows: tripRows } = await client.query("SELECT id, farm FROM trips WHERE id = $1", [tripId]);
+        const trip = tripRows[0];
         if (!trip) throw new ValidationError(`Row ${rowNumber}: Trip_ID ${tripId} does not exist. Import the trip log first.`);
         const farm = requiredText(record, "Farm", rowNumber);
         if (trip.farm !== farm) throw new ValidationError(`Row ${rowNumber}: Farm must match the selected trip (${trip.farm}).`);
-        upsertShed.run(
+        await client.query(`INSERT INTO sheds (id, farm, trip_id, area_sqm, direct_cost_cents, revenue_cents, completion_date, status)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 'Complete')
+          ON CONFLICT(id) DO UPDATE SET farm=EXCLUDED.farm, trip_id=EXCLUDED.trip_id, area_sqm=EXCLUDED.area_sqm, direct_cost_cents=EXCLUDED.direct_cost_cents,
+            revenue_cents=EXCLUDED.revenue_cents, completion_date=EXCLUDED.completion_date, status='Complete'`, [
           requiredText(record, "Shed_ID", rowNumber), farm, tripId,
           requiredNumber(record, "Area_sqm", rowNumber, { positive: true }), Math.round(requiredNumber(record, "Direct_Floor_Cost", rowNumber, { nonNegative: true }) * 100),
           Math.round(requiredNumber(record, "Contract_Revenue", rowNumber, { nonNegative: true }) * 100), requiredDate(record, "Completion_Date", rowNumber),
-        );
+        ]);
       }
       if (sourceKey === "nz-invoices") {
         requiredText(record, "Invoice_ID", rowNumber);
         requiredMonth(record, "Invoice_Month", rowNumber);
         const tripId = requiredText(record, "Trip_ID", rowNumber);
-        if (!db.prepare("SELECT id FROM trips WHERE id = ?").get(tripId)) throw new ValidationError(`Row ${rowNumber}: Trip_ID ${tripId} does not exist. Import the trip log first.`);
+        const { rows: tripRows } = await client.query("SELECT id FROM trips WHERE id = $1", [tripId]);
+        if (!tripRows[0]) throw new ValidationError(`Row ${rowNumber}: Trip_ID ${tripId} does not exist. Import the trip log first.`);
         const labour = requiredNumber(record, "Labour_Cost_NZD", rowNumber, { nonNegative: true });
         const other = requiredNumber(record, "Other_Expenses_NZD", rowNumber, { nonNegative: true });
         const total = requiredNumber(record, "Total_NZD", rowNumber, { nonNegative: true });
@@ -435,7 +382,8 @@ function importRows(sourceKey, source, filename, rows, user) {
         requiredDate(record, "Date", rowNumber);
         requiredText(record, "Reference_ID", rowNumber);
         const tripId = requiredText(record, "Trip_ID", rowNumber);
-        const trip = db.prepare("SELECT farm FROM trips WHERE id = ?").get(tripId);
+        const { rows: tripRows } = await client.query("SELECT farm FROM trips WHERE id = $1", [tripId]);
+        const trip = tripRows[0];
         if (!trip) throw new ValidationError(`Row ${rowNumber}: Trip_ID ${tripId} does not exist. Import the trip log first.`);
         const farm = requiredText(record, "Farm", rowNumber);
         if (trip.farm !== farm) throw new ValidationError(`Row ${rowNumber}: Farm must match the selected trip (${trip.farm}).`);
@@ -446,13 +394,15 @@ function importRows(sourceKey, source, filename, rows, user) {
         requiredMonth(record, "Month", rowNumber);
         requiredNumber(record, "NZD_to_AUD_Rate", rowNumber, { positive: true });
       }
-      insertImportRow.run(batchId, rowNumber, JSON.stringify(record));
+      await client.query("INSERT INTO import_rows (batch_id, row_number, data_json) VALUES ($1, $2, $3)", [batchId, rowNumber, JSON.stringify(record)]);
     }
-    db.exec("COMMIT");
+    await client.query("COMMIT");
     return batchId;
   } catch (error) {
-    db.exec("ROLLBACK");
+    await client.query("ROLLBACK");
     throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -464,42 +414,48 @@ const server = createServer(async (request, response) => {
 
   try {
     if (request.method === "GET" && url.pathname === "/api/health") {
-      return sendJson(response, 200, { status: "ok", database: "sqlite" });
+      await pool.query("SELECT 1");
+      return sendJson(response, 200, { status: "ok", database: "postgres" });
     }
 
     if (request.method === "POST" && url.pathname === "/api/auth/login") {
       const { email = "", password = "" } = await readJson(request);
-      const user = db.prepare("SELECT * FROM users WHERE email = ?").get(String(email).trim().toLowerCase());
+      const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [String(email).trim().toLowerCase()]);
+      const user = rows[0];
       const suppliedHash = user ? Buffer.from(hashPassword(String(password), user.password_salt), "hex") : Buffer.alloc(64);
       const storedHash = user ? Buffer.from(user.password_hash, "hex") : Buffer.alloc(64, 1);
       if (!user || !timingSafeEqual(suppliedHash, storedHash)) return sendJson(response, 401, { error: "Invalid email or password" });
 
       const token = randomBytes(32).toString("base64url");
       const expiresAt = new Date(Date.now() + sessionHours * 60 * 60 * 1000).toISOString();
-      db.prepare("INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)").run(randomUUID(), user.id, hashToken(token), expiresAt);
+      await pool.query("INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)", [randomUUID(), user.id, hashToken(token), expiresAt]);
       return sendJson(response, 200, { user: { id: user.id, email: user.email, displayName: user.display_name, role: user.role } }, { "Set-Cookie": sessionCookie(token, sessionHours * 60 * 60) });
     }
 
     if (request.method === "GET" && url.pathname === "/api/auth/session") {
-      const user = sessionUser(request);
+      const user = await sessionUser(request);
       return user ? sendJson(response, 200, { user }) : sendJson(response, 401, { error: "Not authenticated" });
     }
 
     if (request.method === "POST" && url.pathname === "/api/auth/logout") {
       const token = cookieValue(request, "filokreto_session");
-      if (token) db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(hashToken(token));
+      if (token) await pool.query("DELETE FROM sessions WHERE token_hash = $1", [hashToken(token)]);
       return sendJson(response, 200, { ok: true }, { "Set-Cookie": sessionCookie("", 0) });
     }
 
     if (request.method === "GET" && url.pathname === "/api/dashboard") {
-      if (!sessionUser(request)) return sendJson(response, 401, { error: "Not authenticated" });
-      const trips = db.prepare("SELECT * FROM trips ORDER BY start_date").all().map(mapTrip);
-      const sheds = db.prepare("SELECT * FROM sheds ORDER BY completion_date DESC, id").all().map(mapShed);
+      if (!await sessionUser(request)) return sendJson(response, 401, { error: "Not authenticated" });
+      const [tripResult, shedResult] = await Promise.all([
+        pool.query("SELECT * FROM trips ORDER BY start_date"),
+        pool.query("SELECT * FROM sheds ORDER BY completion_date DESC, id"),
+      ]);
+      const trips = tripResult.rows.map(mapTrip);
+      const sheds = shedResult.rows.map(mapShed);
       return sendJson(response, 200, { trips, sheds });
     }
 
     if (request.method === "GET" && url.pathname === "/api/exports/margin-report") {
-      if (!sessionUser(request)) return sendJson(response, 401, { error: "Not authenticated" });
+      if (!await sessionUser(request)) return sendJson(response, 401, { error: "Not authenticated" });
       const farm = url.searchParams.get("farm")?.trim() ?? "";
       const tripId = url.searchParams.get("tripId")?.trim() ?? "";
       const period = url.searchParams.get("period")?.trim() ?? "";
@@ -515,7 +471,7 @@ const server = createServer(async (request, response) => {
 
     const templateMatch = url.pathname.match(/^\/api\/templates\/([a-z-]+)$/);
     if (request.method === "GET" && templateMatch) {
-      if (!sessionUser(request)) return sendJson(response, 401, { error: "Not authenticated" });
+      if (!await sessionUser(request)) return sendJson(response, 401, { error: "Not authenticated" });
       const source = importSources[templateMatch[1]];
       if (!source) return sendJson(response, 404, { error: "Unknown import source" });
       const buffer = await createTemplate(source);
@@ -530,33 +486,36 @@ const server = createServer(async (request, response) => {
 
     const importMatch = url.pathname.match(/^\/api\/imports\/([a-z-]+)$/);
     if (request.method === "POST" && importMatch) {
-      const user = sessionUser(request);
+      const user = await sessionUser(request);
       if (!user) return sendJson(response, 401, { error: "Not authenticated" });
       const source = importSources[importMatch[1]];
       if (!source) return sendJson(response, 404, { error: "Unknown import source" });
       const filename = decodeURIComponent(String(request.headers["x-file-name"] ?? "import.xlsx"));
       if (!/\.(xlsx|csv)$/i.test(filename)) throw new ValidationError("Only .xlsx and .csv files are accepted.");
       const rows = await parseWorkbook(await readBuffer(request), filename, source);
-      const batchId = importRows(importMatch[1], source, filename, rows, user);
+      const batchId = await importRows(importMatch[1], source, filename, rows, user);
       return sendJson(response, 201, { batchId, source: source.name, importedRows: rows.length, updatesDashboard: ["trip-log", "shed-master"].includes(importMatch[1]) });
     }
 
     if (request.method === "POST" && url.pathname === "/api/projects") {
-      const user = sessionUser(request);
+      const user = await sessionUser(request);
       if (!user) return sendJson(response, 401, { error: "Not authenticated" });
       const project = await readJson(request);
       const id = requiredText(project, "id", 1);
       const tripId = requiredText(project, "tripId", 1);
-      const trip = db.prepare("SELECT farm FROM trips WHERE id = ?").get(tripId);
+      const { rows: tripRows } = await pool.query("SELECT farm FROM trips WHERE id = $1", [tripId]);
+      const trip = tripRows[0];
       if (!trip) throw new ValidationError("Select an existing trip for this project.");
-      if (db.prepare("SELECT id FROM sheds WHERE id = ?").get(id)) throw new ValidationError("A project with this Shed ID already exists.");
-      db.prepare(`INSERT INTO sheds (id, farm, trip_id, area_sqm, direct_cost_cents, revenue_cents, completion_date, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'Complete')`).run(
+      const { rows: existingRows } = await pool.query("SELECT id FROM sheds WHERE id = $1", [id]);
+      if (existingRows[0]) throw new ValidationError("A project with this Shed ID already exists.");
+      await pool.query(`INSERT INTO sheds (id, farm, trip_id, area_sqm, direct_cost_cents, revenue_cents, completion_date, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'Complete')`, [
         id, trip.farm, tripId, requiredNumber(project, "areaSqm", 1, { positive: true }),
         Math.round(requiredNumber(project, "directCost", 1) * 100), Math.round(requiredNumber(project, "revenue", 1) * 100),
         requiredDate(project, "completionDate", 1),
-      );
-      return sendJson(response, 201, { project: mapShed(db.prepare("SELECT * FROM sheds WHERE id = ?").get(id)) });
+      ]);
+      const { rows: projectRows } = await pool.query("SELECT * FROM sheds WHERE id = $1", [id]);
+      return sendJson(response, 201, { project: mapShed(projectRows[0]) });
     }
 
     return sendJson(response, 404, { error: "Not found" });
@@ -567,13 +526,16 @@ const server = createServer(async (request, response) => {
   }
 });
 
+await initializeDatabase();
+await seedDatabase();
+
 server.listen(port, "0.0.0.0", () => {
   console.log(`Filokreto API listening on http://localhost:${port}`);
 });
 
 function shutdown() {
-  server.close(() => {
-    db.close();
+  server.close(async () => {
+    await closeDatabase();
     process.exit(0);
   });
 }

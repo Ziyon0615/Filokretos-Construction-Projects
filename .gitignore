@@ -32,7 +32,7 @@ yarn-error.log*
 .env*
 !.env.example
 
-# local SQLite data
+# legacy local database data
 /backend/data/
 
 # vercel

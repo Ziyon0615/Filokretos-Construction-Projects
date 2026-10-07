@@ -1,23 +1,24 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 import ExcelJS from "exceljs";
 
-test("SQLite API authenticates users and returns protected dashboard data", async (context) => {
-  const temporaryDirectory = await mkdtemp(join(tmpdir(), "filokreto-api-"));
+test("PostgreSQL API authenticates users and returns protected dashboard data", async (context) => {
   const testPort = 41000 + (process.pid % 1000);
   const origin = "http://localhost:3000";
   const baseUrl = `http://127.0.0.1:${testPort}`;
+  const adminEmail = "owner@example.com";
+  const adminPassword = "Test-only-password-2026!";
   const child = spawn(process.execPath, ["backend/server.mjs"], {
     cwd: new URL("..", import.meta.url),
     env: {
       ...process.env,
       PORT: String(testPort),
       FRONTEND_ORIGIN: origin,
-      DATABASE_PATH: join(temporaryDirectory, "test.db"),
+      USE_IN_MEMORY_DATABASE: "true",
+      SEED_DEMO_DATA: "false",
+      ADMIN_EMAIL: adminEmail,
+      ADMIN_PASSWORD: adminPassword,
     },
     stdio: "ignore",
   });
@@ -27,14 +28,14 @@ test("SQLite API authenticates users and returns protected dashboard data", asyn
       child.kill("SIGTERM");
       await new Promise((resolve) => child.once("exit", resolve));
     }
-    await rm(temporaryDirectory, { recursive: true, force: true });
   });
 
   let healthy = false;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     try {
       const response = await fetch(`${baseUrl}/api/health`);
       if (response.ok) {
+        assert.equal((await response.json()).database, "postgres");
         healthy = true;
         break;
       }
@@ -47,14 +48,21 @@ test("SQLite API authenticates users and returns protected dashboard data", asyn
   const rejected = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: origin },
-    body: JSON.stringify({ email: "admin@filokreto.com", password: "incorrect" }),
+    body: JSON.stringify({ email: adminEmail, password: "incorrect" }),
   });
   assert.equal(rejected.status, 401);
+
+  const oldDemoLogin = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: origin },
+    body: JSON.stringify({ email: "admin@filokreto.com", password: "Demo2026!" }),
+  });
+  assert.equal(oldDemoLogin.status, 401);
 
   const login = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: origin },
-    body: JSON.stringify({ email: "admin@filokreto.com", password: "Demo2026!" }),
+    body: JSON.stringify({ email: adminEmail, password: adminPassword }),
   });
   assert.equal(login.status, 200);
   const cookie = login.headers.get("set-cookie")?.split(";", 1)[0];
@@ -140,8 +148,8 @@ test("SQLite API authenticates users and returns protected dashboard data", asyn
   const dashboard = await fetch(`${baseUrl}/api/dashboard`, { headers: { Cookie: cookie, Origin: origin } });
   assert.equal(dashboard.status, 200);
   const data = await dashboard.json();
-  assert.equal(data.trips.length, 13);
-  assert.equal(data.sheds.length, 54);
+  assert.equal(data.trips.length, 1);
+  assert.equal(data.sheds.length, 2);
 
   const exportResponse = await fetch(`${baseUrl}/api/exports/margin-report?tripId=TEST-01&period=2026`, { headers: { Cookie: cookie, Origin: origin } });
   assert.equal(exportResponse.status, 200);

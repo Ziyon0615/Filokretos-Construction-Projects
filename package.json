@@ -8,20 +8,19 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "frontend:dev": "vinext dev",
-    "backend:dev": "node --watch backend/server.mjs",
-    "backend:start": "node backend/server.mjs",
+    "backend:dev": "node --env-file-if-exists=.env --watch backend/server.mjs",
+    "backend:start": "node --env-file-if-exists=.env backend/server.mjs",
     "build": "vinext build",
     "start": "vinext start",
     "test": "npm run build && node --test tests/backend.test.mjs tests/rendered-html.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {
-    "drizzle-orm": "0.45.2",
     "exceljs": "^4.4.0",
-    "next": "16.2.6",
-    "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "next": "^16.4.0",
+    "pg": "^8.16.3",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",
@@ -31,15 +30,18 @@
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
-    "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
-    "eslint-config-next": "16.2.6",
-    "react-server-dom-webpack": "19.2.6",
+    "eslint-config-next": "^16.4.0",
+    "pg-mem": "^3.0.5",
+    "react-server-dom-webpack": "^19.3.0",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3",
     "vinext": "0.0.50",
-    "vite": "8.0.13",
+    "vite": "^8.3.3",
     "wrangler": "4.92.0"
+  },
+  "overrides": {
+    "uuid": "11.1.1"
   },
   "type": "module"
 }
