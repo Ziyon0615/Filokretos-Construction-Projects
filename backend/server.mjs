@@ -3,6 +3,8 @@ import { mkdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { Readable } from "node:stream";
+import ExcelJS from "exceljs";
 
 const port = Number(process.env.PORT ?? 4000);
 const databasePath = resolve(process.env.DATABASE_PATH ?? "backend/data/filokreto.db");
@@ -10,6 +12,14 @@ const sessionHours = Number(process.env.SESSION_HOURS ?? 8);
 const allowedOrigins = new Set((process.env.FRONTEND_ORIGIN ?? "http://localhost:3000").split(",").map((value) => value.trim()).filter(Boolean));
 const cookieSecure = process.env.COOKIE_SECURE === "true";
 const cookieSameSite = process.env.COOKIE_SAME_SITE ?? "Lax";
+
+const importSources = {
+  "shed-master": { name: "Shed master", columns: ["Shed_ID", "Farm", "Trip_ID", "Area_sqm", "Direct_Floor_Cost", "Contract_Revenue", "Completion_Date"] },
+  "trip-log": { name: "Trip log", columns: ["Trip_ID", "Farm", "Start_Date", "End_Date", "Sheds_Completed", "Flight_Cost", "Accommodation", "Food_Allowance", "Vehicle_Cost"] },
+  "nz-invoices": { name: "NZ invoices", columns: ["Invoice_ID", "Invoice_Month", "Trip_ID", "Labour_Cost_NZD", "Other_Expenses_NZD", "Total_NZD"] },
+  "au-xero-costs": { name: "AU Xero costs", columns: ["Date", "Reference_ID", "Trip_ID", "Farm", "Category", "Amount_AUD"] },
+  "fx-rates": { name: "FX rates", columns: ["Month", "NZD_to_AUD_Rate"] },
+};
 
 mkdirSync(dirname(databasePath), { recursive: true });
 const db = new DatabaseSync(databasePath);
@@ -54,6 +64,20 @@ db.exec(`
     revenue_cents INTEGER NOT NULL,
     completion_date TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'Complete'
+  );
+  CREATE TABLE IF NOT EXISTS import_batches (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    row_count INTEGER NOT NULL,
+    imported_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS import_rows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+    row_number INTEGER NOT NULL,
+    data_json TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS sessions_token_hash_idx ON sessions(token_hash);
   CREATE INDEX IF NOT EXISTS sheds_farm_idx ON sheds(farm);
@@ -134,7 +158,7 @@ function setCors(request, response) {
     response.setHeader("Access-Control-Allow-Origin", origin);
     response.setHeader("Vary", "Origin");
     response.setHeader("Access-Control-Allow-Credentials", "true");
-    response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    response.setHeader("Access-Control-Allow-Headers", "Content-Type, X-File-Name");
     response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   }
   return !origin || allowedOrigins.has(origin);
@@ -153,6 +177,19 @@ async function readJson(request) {
   }
   return body ? JSON.parse(body) : {};
 }
+
+async function readBuffer(request, limit = 10_000_000) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > limit) throw new ValidationError("The import file exceeds the 10 MB limit.");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+class ValidationError extends Error {}
 
 function cookieValue(request, name) {
   const cookies = (request.headers.cookie ?? "").split(";");
@@ -191,6 +228,232 @@ function mapShed(row) {
     directCost: row.direct_cost_cents / 100, revenue: row.revenue_cents / 100,
     completionDate: row.completion_date, status: row.status,
   };
+}
+
+function cellValue(value) {
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (value && typeof value === "object") {
+    if ("result" in value) return cellValue(value.result);
+    if ("richText" in value) return value.richText.map((part) => part.text).join("");
+    if ("text" in value) return value.text;
+  }
+  return value ?? "";
+}
+
+function requiredText(row, column, rowNumber) {
+  const value = String(row[column] ?? "").trim();
+  if (!value) throw new ValidationError(`Row ${rowNumber}: ${column} is required.`);
+  return value;
+}
+
+function requiredNumber(row, column, rowNumber, { positive = false, nonNegative = false, integer = false } = {}) {
+  const value = Number(row[column]);
+  if (!Number.isFinite(value) || (positive && value <= 0) || (nonNegative && value < 0) || (integer && !Number.isInteger(value))) {
+    const qualifier = positive ? " positive" : nonNegative ? " non-negative" : "";
+    throw new ValidationError(`Row ${rowNumber}: ${column} must be a valid${qualifier}${integer ? " whole" : ""} number.`);
+  }
+  return value;
+}
+
+function requiredDate(row, column, rowNumber) {
+  const value = requiredText(row, column, rowNumber);
+  const date = new Date(value.length === 10 ? `${value}T00:00:00Z` : value);
+  if (Number.isNaN(date.getTime())) throw new ValidationError(`Row ${rowNumber}: ${column} must be a valid date.`);
+  return date.toISOString().slice(0, 10);
+}
+
+function requiredMonth(row, column, rowNumber) {
+  const value = requiredText(row, column, rowNumber);
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(value)) throw new ValidationError(`Row ${rowNumber}: ${column} must use YYYY-MM format.`);
+  return value;
+}
+
+async function parseWorkbook(buffer, filename, source) {
+  const workbook = new ExcelJS.Workbook();
+  if (filename.toLowerCase().endsWith(".csv")) {
+    await workbook.csv.read(Readable.from([buffer]));
+  } else {
+    await workbook.xlsx.load(buffer);
+  }
+  const worksheet = workbook.worksheets[0];
+  if (!worksheet) throw new ValidationError("The workbook does not contain a worksheet.");
+  const headers = worksheet.getRow(1).values.slice(1).map((value) => String(cellValue(value)).trim());
+  const missing = source.columns.filter((column) => !headers.includes(column));
+  if (missing.length) throw new ValidationError(`Missing required columns: ${missing.join(", ")}.`);
+
+  const rows = [];
+  worksheet.eachRow({ includeEmpty: false }, (sheetRow, rowNumber) => {
+    if (rowNumber === 1) return;
+    const record = Object.fromEntries(headers.map((header, index) => [header, cellValue(sheetRow.getCell(index + 1).value)]));
+    if (Object.values(record).some((value) => String(value).trim() !== "")) rows.push({ rowNumber, record });
+  });
+  if (!rows.length) throw new ValidationError("The spreadsheet has headers but no data rows.");
+  if (rows.length > 5000) throw new ValidationError("A single import can contain at most 5,000 rows.");
+  return rows;
+}
+
+async function createTemplate(source) {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "Filokreto Cost & Margin Monitor";
+  workbook.created = new Date();
+  const worksheet = workbook.addWorksheet("Data", { views: [{ state: "frozen", ySplit: 1 }] });
+  worksheet.columns = source.columns.map((header) => ({ header, key: header, width: Math.max(16, header.length + 3) }));
+  const header = worksheet.getRow(1);
+  header.height = 26;
+  header.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  header.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF286FD7" } };
+  header.alignment = { vertical: "middle", horizontal: "center" };
+  worksheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: source.columns.length } };
+  return workbook.xlsx.writeBuffer();
+}
+
+async function createMarginReport({ farm, tripId, period }) {
+  const conditions = [];
+  const parameters = [];
+  if (farm) {
+    conditions.push("sheds.farm = ?");
+    parameters.push(farm);
+  }
+  if (tripId) {
+    conditions.push("sheds.trip_id = ?");
+    parameters.push(tripId);
+  }
+  if (period) {
+    conditions.push("sheds.completion_date LIKE ?");
+    parameters.push(`${period}-%`);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const rows = db.prepare(`SELECT sheds.*, trips.batch_size, trips.flight_cost_cents, trips.accommodation_cents,
+      trips.allowance_cents, trips.nz_labour_cents, trips.au_cost_cents
+    FROM sheds JOIN trips ON trips.id = sheds.trip_id
+    ${where}
+    ORDER BY sheds.completion_date DESC, sheds.id`).all(...parameters);
+
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "Filokreto Cost & Margin Monitor";
+  workbook.created = new Date();
+  const worksheet = workbook.addWorksheet("Margin report", { views: [{ state: "frozen", ySplit: 1 }] });
+  worksheet.columns = [
+    { header: "Shed ID", key: "shedId", width: 18 },
+    { header: "Farm", key: "farm", width: 24 },
+    { header: "Trip ID", key: "tripId", width: 15 },
+    { header: "Completion Date", key: "completionDate", width: 17 },
+    { header: "Area sqm", key: "areaSqm", width: 13 },
+    { header: "Revenue AUD", key: "revenue", width: 17 },
+    { header: "Direct Cost AUD", key: "directCost", width: 18 },
+    { header: "Allocated Trip Cost AUD", key: "logistics", width: 23 },
+    { header: "Total Cost AUD", key: "totalCost", width: 17 },
+    { header: "Margin AUD", key: "margin", width: 16 },
+    { header: "Margin Percent", key: "marginPct", width: 17 },
+  ];
+
+  for (const row of rows) {
+    const tripCostCents = row.flight_cost_cents + row.accommodation_cents + row.allowance_cents + row.nz_labour_cents + row.au_cost_cents;
+    const logistics = tripCostCents / row.batch_size / 100;
+    const directCost = row.direct_cost_cents / 100;
+    const revenue = row.revenue_cents / 100;
+    const totalCost = directCost + logistics;
+    const margin = revenue - totalCost;
+    worksheet.addRow({
+      shedId: row.id,
+      farm: row.farm,
+      tripId: row.trip_id,
+      completionDate: row.completion_date,
+      areaSqm: row.area_sqm,
+      revenue,
+      directCost,
+      logistics,
+      totalCost,
+      margin,
+      marginPct: revenue ? margin / revenue : 0,
+    });
+  }
+
+  const header = worksheet.getRow(1);
+  header.height = 26;
+  header.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  header.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF286FD7" } };
+  header.alignment = { vertical: "middle", horizontal: "center" };
+  worksheet.autoFilter = { from: "A1", to: "K1" };
+  worksheet.getColumn("completionDate").numFmt = "yyyy-mm-dd";
+  worksheet.getColumn("areaSqm").numFmt = "0.00";
+  for (const key of ["revenue", "directCost", "logistics", "totalCost", "margin"]) worksheet.getColumn(key).numFmt = '"$"#,##0.00';
+  worksheet.getColumn("marginPct").numFmt = "0.00%";
+  return workbook.xlsx.writeBuffer();
+}
+
+function importRows(sourceKey, source, filename, rows, user) {
+  const batchId = randomUUID();
+  const insertImportRow = db.prepare("INSERT INTO import_rows (batch_id, row_number, data_json) VALUES (?, ?, ?)");
+  const upsertTrip = db.prepare(`INSERT INTO trips (id, farm, start_date, end_date, batch_size, flight_cost_cents, accommodation_cents, allowance_cents, nz_labour_cents, au_cost_cents)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    ON CONFLICT(id) DO UPDATE SET farm=excluded.farm, start_date=excluded.start_date, end_date=excluded.end_date, batch_size=excluded.batch_size,
+      flight_cost_cents=excluded.flight_cost_cents, accommodation_cents=excluded.accommodation_cents, allowance_cents=excluded.allowance_cents, au_cost_cents=excluded.au_cost_cents`);
+  const upsertShed = db.prepare(`INSERT INTO sheds (id, farm, trip_id, area_sqm, direct_cost_cents, revenue_cents, completion_date, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'Complete')
+    ON CONFLICT(id) DO UPDATE SET farm=excluded.farm, trip_id=excluded.trip_id, area_sqm=excluded.area_sqm, direct_cost_cents=excluded.direct_cost_cents,
+      revenue_cents=excluded.revenue_cents, completion_date=excluded.completion_date, status='Complete'`);
+
+  db.exec("BEGIN");
+  try {
+    db.prepare("INSERT INTO import_batches (id, source, filename, row_count, imported_by) VALUES (?, ?, ?, ?, ?)").run(batchId, source.name, filename, rows.length, user.id);
+    for (const { rowNumber, record } of rows) {
+      if (sourceKey === "trip-log") {
+        const startDate = requiredDate(record, "Start_Date", rowNumber);
+        const endDate = requiredDate(record, "End_Date", rowNumber);
+        if (endDate < startDate) throw new ValidationError(`Row ${rowNumber}: End_Date cannot be before Start_Date.`);
+        upsertTrip.run(
+          requiredText(record, "Trip_ID", rowNumber), requiredText(record, "Farm", rowNumber), startDate,
+          endDate, requiredNumber(record, "Sheds_Completed", rowNumber, { positive: true, integer: true }),
+          Math.round(requiredNumber(record, "Flight_Cost", rowNumber, { nonNegative: true }) * 100), Math.round(requiredNumber(record, "Accommodation", rowNumber, { nonNegative: true }) * 100),
+          Math.round(requiredNumber(record, "Food_Allowance", rowNumber, { nonNegative: true }) * 100), Math.round(requiredNumber(record, "Vehicle_Cost", rowNumber, { nonNegative: true }) * 100),
+        );
+      }
+      if (sourceKey === "shed-master") {
+        const tripId = requiredText(record, "Trip_ID", rowNumber);
+        const trip = db.prepare("SELECT id, farm FROM trips WHERE id = ?").get(tripId);
+        if (!trip) throw new ValidationError(`Row ${rowNumber}: Trip_ID ${tripId} does not exist. Import the trip log first.`);
+        const farm = requiredText(record, "Farm", rowNumber);
+        if (trip.farm !== farm) throw new ValidationError(`Row ${rowNumber}: Farm must match the selected trip (${trip.farm}).`);
+        upsertShed.run(
+          requiredText(record, "Shed_ID", rowNumber), farm, tripId,
+          requiredNumber(record, "Area_sqm", rowNumber, { positive: true }), Math.round(requiredNumber(record, "Direct_Floor_Cost", rowNumber, { nonNegative: true }) * 100),
+          Math.round(requiredNumber(record, "Contract_Revenue", rowNumber, { nonNegative: true }) * 100), requiredDate(record, "Completion_Date", rowNumber),
+        );
+      }
+      if (sourceKey === "nz-invoices") {
+        requiredText(record, "Invoice_ID", rowNumber);
+        requiredMonth(record, "Invoice_Month", rowNumber);
+        const tripId = requiredText(record, "Trip_ID", rowNumber);
+        if (!db.prepare("SELECT id FROM trips WHERE id = ?").get(tripId)) throw new ValidationError(`Row ${rowNumber}: Trip_ID ${tripId} does not exist. Import the trip log first.`);
+        const labour = requiredNumber(record, "Labour_Cost_NZD", rowNumber, { nonNegative: true });
+        const other = requiredNumber(record, "Other_Expenses_NZD", rowNumber, { nonNegative: true });
+        const total = requiredNumber(record, "Total_NZD", rowNumber, { nonNegative: true });
+        if (Math.abs(labour + other - total) > 0.01) throw new ValidationError(`Row ${rowNumber}: Total_NZD must equal Labour_Cost_NZD plus Other_Expenses_NZD.`);
+      }
+      if (sourceKey === "au-xero-costs") {
+        requiredDate(record, "Date", rowNumber);
+        requiredText(record, "Reference_ID", rowNumber);
+        const tripId = requiredText(record, "Trip_ID", rowNumber);
+        const trip = db.prepare("SELECT farm FROM trips WHERE id = ?").get(tripId);
+        if (!trip) throw new ValidationError(`Row ${rowNumber}: Trip_ID ${tripId} does not exist. Import the trip log first.`);
+        const farm = requiredText(record, "Farm", rowNumber);
+        if (trip.farm !== farm) throw new ValidationError(`Row ${rowNumber}: Farm must match the selected trip (${trip.farm}).`);
+        requiredText(record, "Category", rowNumber);
+        requiredNumber(record, "Amount_AUD", rowNumber, { nonNegative: true });
+      }
+      if (sourceKey === "fx-rates") {
+        requiredMonth(record, "Month", rowNumber);
+        requiredNumber(record, "NZD_to_AUD_Rate", rowNumber, { positive: true });
+      }
+      insertImportRow.run(batchId, rowNumber, JSON.stringify(record));
+    }
+    db.exec("COMMIT");
+    return batchId;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 const server = createServer(async (request, response) => {
@@ -235,9 +498,71 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 200, { trips, sheds });
     }
 
+    if (request.method === "GET" && url.pathname === "/api/exports/margin-report") {
+      if (!sessionUser(request)) return sendJson(response, 401, { error: "Not authenticated" });
+      const farm = url.searchParams.get("farm")?.trim() ?? "";
+      const tripId = url.searchParams.get("tripId")?.trim() ?? "";
+      const period = url.searchParams.get("period")?.trim() ?? "";
+      if (period && !/^\d{4}$/.test(period)) throw new ValidationError("The report period must be a four-digit year.");
+      const buffer = await createMarginReport({ farm, tripId, period });
+      response.writeHead(200, {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": 'attachment; filename="filokreto-margin-report.xlsx"',
+        "Cache-Control": "no-store",
+      });
+      return response.end(Buffer.from(buffer));
+    }
+
+    const templateMatch = url.pathname.match(/^\/api\/templates\/([a-z-]+)$/);
+    if (request.method === "GET" && templateMatch) {
+      if (!sessionUser(request)) return sendJson(response, 401, { error: "Not authenticated" });
+      const source = importSources[templateMatch[1]];
+      if (!source) return sendJson(response, 404, { error: "Unknown import source" });
+      const buffer = await createTemplate(source);
+      const filename = `${templateMatch[1]}-template.xlsx`;
+      response.writeHead(200, {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Cache-Control": "no-store",
+      });
+      return response.end(Buffer.from(buffer));
+    }
+
+    const importMatch = url.pathname.match(/^\/api\/imports\/([a-z-]+)$/);
+    if (request.method === "POST" && importMatch) {
+      const user = sessionUser(request);
+      if (!user) return sendJson(response, 401, { error: "Not authenticated" });
+      const source = importSources[importMatch[1]];
+      if (!source) return sendJson(response, 404, { error: "Unknown import source" });
+      const filename = decodeURIComponent(String(request.headers["x-file-name"] ?? "import.xlsx"));
+      if (!/\.(xlsx|csv)$/i.test(filename)) throw new ValidationError("Only .xlsx and .csv files are accepted.");
+      const rows = await parseWorkbook(await readBuffer(request), filename, source);
+      const batchId = importRows(importMatch[1], source, filename, rows, user);
+      return sendJson(response, 201, { batchId, source: source.name, importedRows: rows.length, updatesDashboard: ["trip-log", "shed-master"].includes(importMatch[1]) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/projects") {
+      const user = sessionUser(request);
+      if (!user) return sendJson(response, 401, { error: "Not authenticated" });
+      const project = await readJson(request);
+      const id = requiredText(project, "id", 1);
+      const tripId = requiredText(project, "tripId", 1);
+      const trip = db.prepare("SELECT farm FROM trips WHERE id = ?").get(tripId);
+      if (!trip) throw new ValidationError("Select an existing trip for this project.");
+      if (db.prepare("SELECT id FROM sheds WHERE id = ?").get(id)) throw new ValidationError("A project with this Shed ID already exists.");
+      db.prepare(`INSERT INTO sheds (id, farm, trip_id, area_sqm, direct_cost_cents, revenue_cents, completion_date, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'Complete')`).run(
+        id, trip.farm, tripId, requiredNumber(project, "areaSqm", 1, { positive: true }),
+        Math.round(requiredNumber(project, "directCost", 1) * 100), Math.round(requiredNumber(project, "revenue", 1) * 100),
+        requiredDate(project, "completionDate", 1),
+      );
+      return sendJson(response, 201, { project: mapShed(db.prepare("SELECT * FROM sheds WHERE id = ?").get(id)) });
+    }
+
     return sendJson(response, 404, { error: "Not found" });
   } catch (error) {
     console.error(error);
+    if (error instanceof ValidationError) return sendJson(response, 400, { error: error.message });
     return sendJson(response, 500, { error: "Internal server error" });
   }
 });

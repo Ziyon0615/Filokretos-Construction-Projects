@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   allocatedTripCost,
-  farmNames,
   shedEconomics,
   sheds as demoSheds,
   tripCost,
@@ -15,8 +14,6 @@ import {
 
 type View = "Overview" | "Projects" | "Trips & costs" | "Scenario analysis" | "Data quality";
 
-const demoEmail = "admin@filokreto.com";
-const demoPassword = "Demo2026!";
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 
 const views: { label: View; icon: string }[] = [
@@ -33,6 +30,14 @@ const sourceTemplates: Record<string, string[]> = {
   "NZ invoices": ["Invoice_ID", "Invoice_Month", "Trip_ID", "Labour_Cost_NZD", "Other_Expenses_NZD", "Total_NZD"],
   "AU Xero costs": ["Date", "Reference_ID", "Trip_ID", "Farm", "Category", "Amount_AUD"],
   "FX rates": ["Month", "NZD_to_AUD_Rate"],
+};
+
+const sourceSlugs: Record<string, string> = {
+  "Shed master": "shed-master",
+  "Trip log": "trip-log",
+  "NZ invoices": "nz-invoices",
+  "AU Xero costs": "au-xero-costs",
+  "FX rates": "fx-rates",
 };
 
 const aud = new Intl.NumberFormat("en-AU", {
@@ -59,6 +64,7 @@ export function DashboardApp() {
   const [tripId, setTripId] = useState("All trips");
   const [period, setPeriod] = useState("All time");
   const [importOpen, setImportOpen] = useState(false);
+  const [projectOpen, setProjectOpen] = useState(false);
   const [shedRecords, setShedRecords] = useState<Shed[]>(demoSheds);
   const [tripRecords, setTripRecords] = useState<Trip[]>(demoTrips);
 
@@ -82,6 +88,8 @@ export function DashboardApp() {
     () => tripRecords.filter((trip) => farm === "All farms" || trip.farm === farm),
     [farm, tripRecords],
   );
+  const availableFarms = useMemo(() => Array.from(new Set(shedRecords.map((shed) => shed.farm))).sort(), [shedRecords]);
+  const availablePeriods = useMemo(() => Array.from(new Set(shedRecords.map((shed) => shed.completionDate.slice(0, 4)))).sort().reverse(), [shedRecords]);
   const filteredSheds = useMemo(
     () => shedRecords.filter((shed) =>
       (farm === "All farms" || shed.farm === farm) &&
@@ -95,6 +103,15 @@ export function DashboardApp() {
     setTripId("All trips");
   }
 
+  async function refreshDashboard() {
+    const response = await fetch(`${apiUrl}/api/dashboard`, { credentials: "include" });
+    if (!response.ok) return false;
+    const data = await response.json() as { sheds: Shed[]; trips: Trip[] };
+    setShedRecords(data.sheds);
+    setTripRecords(data.trips);
+    return true;
+  }
+
   async function login(email: string, password: string) {
     try {
       const response = await fetch(`${apiUrl}/api/auth/login`, {
@@ -104,12 +121,7 @@ export function DashboardApp() {
         body: JSON.stringify({ email, password }),
       });
       if (!response.ok) return response.status === 401 ? "The email or password is incorrect." : "The login service could not complete the request.";
-      const dashboardResponse = await fetch(`${apiUrl}/api/dashboard`, { credentials: "include" });
-      if (dashboardResponse.ok) {
-        const data = await dashboardResponse.json() as { sheds: Shed[]; trips: Trip[] };
-        setShedRecords(data.sheds);
-        setTripRecords(data.trips);
-      }
+      await refreshDashboard();
       setIsAuthenticated(true);
       return null;
     } catch {
@@ -134,7 +146,7 @@ export function DashboardApp() {
     <div className="app-shell">
       <Sidebar active={view} onChange={setView} />
       <main className="main">
-        <Topbar onImport={() => setImportOpen(true)} onExport={() => exportReport(filteredSheds, tripRecords)} onLogout={logout} />
+        <Topbar onImport={() => setImportOpen(true)} onExport={() => exportReport({ farm, tripId, period })} onLogout={logout} />
         <div className="content">
           <MobileTabs active={view} onChange={setView} />
           <PageHeading view={view}>
@@ -143,7 +155,9 @@ export function DashboardApp() {
                 farm={farm}
                 tripId={tripId}
                 period={period}
+                availableFarms={availableFarms}
                 availableTrips={availableTrips}
+                availablePeriods={availablePeriods}
                 onFarmChange={changeFarm}
                 onTripChange={setTripId}
                 onPeriodChange={setPeriod}
@@ -151,13 +165,14 @@ export function DashboardApp() {
             )}
           </PageHeading>
           {view === "Overview" && <Overview records={filteredSheds} tripRecords={tripRecords} />}
-          {view === "Projects" && <Projects records={filteredSheds} tripRecords={tripRecords} />}
+          {view === "Projects" && <Projects records={filteredSheds} tripRecords={tripRecords} onAdd={() => setProjectOpen(true)} />}
           {view === "Trips & costs" && <TripsAndCosts farm={farm} selectedTrip={tripId} tripRecords={tripRecords} />}
           {view === "Scenario analysis" && <ScenarioAnalysis />}
           {view === "Data quality" && <DataQuality />}
         </div>
       </main>
-      {importOpen && <ImportModal onClose={() => setImportOpen(false)} />}
+      {importOpen && <ImportModal onClose={() => setImportOpen(false)} onImported={refreshDashboard} />}
+      {projectOpen && <ProjectModal tripRecords={tripRecords} onClose={() => setProjectOpen(false)} onCreated={async () => { await refreshDashboard(); setProjectOpen(false); }} />}
     </div>
   );
 }
@@ -179,12 +194,6 @@ function LoginScreen({ onLogin }: { onLogin: (email: string, password: string) =
     const loginError = await onLogin(email.trim(), password);
     setSubmitting(false);
     setError(loginError ?? "");
-  }
-
-  function fillDemoAccount() {
-    setEmail(demoEmail);
-    setPassword(demoPassword);
-    setError("");
   }
 
   return (
@@ -213,8 +222,7 @@ function LoginScreen({ onLogin }: { onLogin: (email: string, password: string) =
           {error && <p className="login-error" role="alert">{error}</p>}
           <button className="login-submit" type="submit" disabled={submitting}>{submitting ? "Signing in…" : "Sign in to dashboard"} <span aria-hidden="true">→</span></button>
 
-          <div className="demo-access"><div><strong>Demo workspace access</strong><span>{demoEmail}<br />{demoPassword}</span></div><button type="button" onClick={fillDemoAccount}>Use demo</button></div>
-          <p className="login-security">Prototype access only. Connect a managed identity provider before production launch.</p>
+          <p className="login-security">Authorized users only.</p>
         </form>
       </section>
     </main>
@@ -239,23 +247,39 @@ function Sidebar({ active, onChange }: { active: View; onChange: (view: View) =>
       <div className="sidebar-foot">
         <div className="sync-card">
           <div className="sync-row"><span>System ready</span><span className="status-dot" aria-hidden="true" /></div>
-          <p>Local SQLite database<br />Authenticated project records</p>
+          <p>Authenticated project records</p>
         </div>
       </div>
     </aside>
   );
 }
 
-function Topbar({ onImport, onExport, onLogout }: { onImport: () => void; onExport: () => void; onLogout: () => void }) {
+function Topbar({ onImport, onExport, onLogout }: { onImport: () => void; onExport: () => Promise<void>; onLogout: () => void }) {
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+
+  async function runExport() {
+    setExporting(true);
+    setExportError("");
+    try {
+      await onExport();
+    } catch {
+      setExportError("The Excel report could not be downloaded.");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <header className="topbar">
       <div className="mobile-brand"><span className="brand-mark">FK</span>Filokreto</div>
       <div className="breadcrumb">Australian operations&nbsp; / &nbsp;<strong>Margin monitor</strong></div>
       <div className="top-actions">
-        <button className="button secondary" type="button" onClick={onExport}>Export report</button>
+        <button className="button secondary" type="button" disabled={exporting} onClick={runExport}>{exporting ? "Exporting…" : "Export Excel"}</button>
         <button className="button primary" type="button" onClick={onImport}>Import data</button>
         <button className="user-chip" type="button" onClick={onLogout} aria-label="Sign out"><div className="avatar">FM</div><div className="user-copy"><strong>Filokreto Director</strong><span>Sign out</span></div></button>
       </div>
+      {exportError && <p className="topbar-error" role="alert">{exportError}</p>}
     </header>
   );
 }
@@ -284,20 +308,22 @@ function PageHeading({ view, children }: { view: View; children?: React.ReactNod
   );
 }
 
-function Filters({ farm, tripId, period, availableTrips, onFarmChange, onTripChange, onPeriodChange }: {
+function Filters({ farm, tripId, period, availableFarms, availableTrips, availablePeriods, onFarmChange, onTripChange, onPeriodChange }: {
   farm: "All farms" | FarmName;
   tripId: string;
   period: string;
+  availableFarms: FarmName[];
   availableTrips: Trip[];
+  availablePeriods: string[];
   onFarmChange: (value: "All farms" | FarmName) => void;
   onTripChange: (value: string) => void;
   onPeriodChange: (value: string) => void;
 }) {
   return (
     <div className="filter-bar" aria-label="Dashboard filters">
-      <div className="select-wrap"><select value={farm} onChange={(event) => onFarmChange(event.target.value as "All farms" | FarmName)} aria-label="Filter by farm"><option>All farms</option>{farmNames.map((name) => <option key={name}>{name}</option>)}</select></div>
+      <div className="select-wrap"><select value={farm} onChange={(event) => onFarmChange(event.target.value as "All farms" | FarmName)} aria-label="Filter by farm"><option>All farms</option>{availableFarms.map((name) => <option key={name}>{name}</option>)}</select></div>
       <div className="select-wrap"><select value={tripId} onChange={(event) => onTripChange(event.target.value)} aria-label="Filter by trip"><option>All trips</option>{availableTrips.map((trip) => <option key={trip.id}>{trip.id}</option>)}</select></div>
-      <div className="select-wrap"><select value={period} onChange={(event) => onPeriodChange(event.target.value)} aria-label="Filter by period"><option>All time</option><option>2024</option><option>2025</option></select></div>
+      <div className="select-wrap"><select value={period} onChange={(event) => onPeriodChange(event.target.value)} aria-label="Filter by period"><option>All time</option>{availablePeriods.map((year) => <option key={year}>{year}</option>)}</select></div>
     </div>
   );
 }
@@ -350,7 +376,7 @@ function Metric({ label, value, note, delta, warning, accent }: { label: string;
   return <article className="metric-card" style={{ "--accent": accent } as React.CSSProperties}><div className="metric-top"><span>{label}</span><span className={`delta ${warning ? "warn" : ""}`}>{delta}</span></div><div className="metric-value">{value}</div><div className="metric-note">{note}</div></article>;
 }
 
-function Projects({ records, tripRecords }: { records: Shed[]; tripRecords: Trip[] }) {
+function Projects({ records, tripRecords, onAdd }: { records: Shed[]; tripRecords: Trip[]; onAdd: () => void }) {
   const [query, setQuery] = useState("");
   const visible = records.filter((record) => `${record.id} ${record.farm} ${record.tripId}`.toLowerCase().includes(query.toLowerCase()));
   const totals = summarize(records, tripRecords);
@@ -362,13 +388,13 @@ function Projects({ records, tripRecords }: { records: Shed[]; tripRecords: Trip
         <div className="summary-item"><span>Total area</span><strong>{Math.round(records.reduce((sum, item) => sum + item.areaSqm, 0) / 1000)}k m²</strong></div>
         <div className="summary-item"><span>Margin</span><strong>{pct(totals.marginPct)}</strong></div>
       </div>
-      <div className="panel table-panel"><div className="panel-header"><div><h2>Project register</h2><p>{visible.length} matching records</p></div><input className="search-input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search shed or trip" aria-label="Search projects" /></div><ProjectRows records={visible} tripRecords={tripRecords} /></div>
+      <div className="panel table-panel"><div className="panel-header"><div><h2>Project register</h2><p>{visible.length} matching records</p></div><div className="table-actions"><input className="search-input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search shed or trip" aria-label="Search projects" /><button className="button primary" type="button" onClick={onAdd}>Add project</button></div></div><ProjectRows records={visible} tripRecords={tripRecords} /></div>
     </>
   );
 }
 
 function ProjectTable({ records, tripRecords, title, subtitle }: { records: Shed[]; tripRecords: Trip[]; title: string; subtitle: string }) {
-  return <section className="panel table-panel"><div className="panel-header"><div><h2>{title}</h2><p>{subtitle}</p></div><span className="delta">SQLite data</span></div><ProjectRows records={records} tripRecords={tripRecords} /></section>;
+  return <section className="panel table-panel"><div className="panel-header"><div><h2>{title}</h2><p>{subtitle}</p></div><span className="delta">Live data</span></div><ProjectRows records={records} tripRecords={tripRecords} /></section>;
 }
 
 function ProjectRows({ records, tripRecords }: { records: Shed[]; tripRecords: Trip[] }) {
@@ -451,23 +477,124 @@ function DataQuality() {
   );
 }
 
-function ImportModal({ onClose }: { onClose: () => void }) {
+function ImportModal({ onClose, onImported }: { onClose: () => void; onImported: () => Promise<boolean> }) {
   const [source, setSource] = useState("Shed master");
-  const [fileName, setFileName] = useState("");
-  const [staged, setStaged] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const sources = [["Shed master", "Revenue and direct costs"], ["Trip log", "Flights, labour and allowances"], ["NZ invoices", "Intercompany NZD records"], ["AU Xero costs", "Australian-side expenses"], ["FX rates", "Monthly conversion rates"]];
+
+  async function downloadTemplate() {
+    setResult(null);
+    const response = await fetch(`${apiUrl}/api/templates/${sourceSlugs[source]}`, { credentials: "include" });
+    if (!response.ok) {
+      setResult({ type: "error", message: "The template could not be downloaded." });
+      return;
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${sourceSlugs[source]}-template.xlsx`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function importFile() {
+    if (!selectedFile) return;
+    setBusy(true);
+    setResult(null);
+    try {
+      const response = await fetch(`${apiUrl}/api/imports/${sourceSlugs[source]}`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": selectedFile.type || "application/octet-stream", "X-File-Name": encodeURIComponent(selectedFile.name) },
+        body: selectedFile,
+      });
+      const data = await response.json() as { error?: string; importedRows?: number; updatesDashboard?: boolean };
+      if (!response.ok) {
+        setResult({ type: "error", message: data.error ?? "The spreadsheet could not be imported." });
+        return;
+      }
+      await onImported();
+      const followUp = data.updatesDashboard === false ? " Stored for reconciliation; this source does not update dashboard totals yet." : "";
+      setResult({ type: "success", message: `${data.importedRows ?? 0} rows imported successfully.${followUp}` });
+      setSelectedFile(null);
+      if (fileRef.current) fileRef.current.value = "";
+    } catch {
+      setResult({ type: "error", message: "The import service could not be reached." });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><div className="modal-header"><div><h2 id="import-title">Import source data</h2><p>Select the dataset, then attach its latest Excel or CSV export.</p></div><button className="close-button" type="button" onClick={onClose} aria-label="Close import dialog">×</button></div>
-        <div className="modal-body"><div className="source-grid">{sources.map(([title, description]) => <button className={`source-option ${source === title ? "selected" : ""}`} type="button" key={title} onClick={() => { setSource(title); setCopied(false); }}><strong>{title}</strong><span>{description}</span></button>)}</div>
+        <div className="modal-body"><div className="source-grid">{sources.map(([title, description]) => <button className={`source-option ${source === title ? "selected" : ""}`} type="button" key={title} onClick={() => { setSource(title); setCopied(false); setSelectedFile(null); setResult(null); }}><strong>{title}</strong><span>{description}</span></button>)}</div>
           <div className="template-guide">
-            <div className="template-guide-head"><div><strong>Excel template columns</strong><span>Paste these headers into row 1 without renaming them.</span></div><button className="button template-button" type="button" onClick={async () => { await navigator.clipboard.writeText(sourceTemplates[source].join("\t")); setCopied(true); }}>{copied ? "Headers copied" : "Copy headers"}</button></div>
+            <div className="template-guide-head"><div><strong>Excel import template</strong><span>Download the formatted workbook or copy its required headers.</span></div><div className="template-actions"><button className="button secondary" type="button" onClick={async () => { await navigator.clipboard.writeText(sourceTemplates[source].join("\t")); setCopied(true); }}>{copied ? "Copied" : "Copy headers"}</button><button className="button template-button" type="button" onClick={downloadTemplate}>Download .xlsx</button></div></div>
             <div className="column-chips">{sourceTemplates[source].map((column) => <code key={column}>{column}</code>)}</div>
           </div>
-          <div className="drop-zone"><strong>{source} file</strong><span>Accepted formats: .xlsx and .csv</span><input ref={fileRef} type="file" accept=".xlsx,.csv" hidden onChange={(event) => { setFileName(event.target.files?.[0]?.name ?? ""); setStaged(false); }} /><button className="button secondary" type="button" onClick={() => fileRef.current?.click()}>Choose file</button>{fileName && <div className="file-name">Ready to validate: {fileName}</div>}{fileName && <button className="button primary import-action" type="button" onClick={() => setStaged(true)}>Stage for validation</button>}{staged && <div className="staged-note">File staged. Persistent import processing will be connected to the approved database.</div>}</div>
+          <div className="drop-zone"><strong>{source} file</strong><span>Accepted formats: .xlsx and .csv · Maximum 5,000 rows</span><input ref={fileRef} type="file" accept=".xlsx,.csv" hidden onChange={(event) => { setSelectedFile(event.target.files?.[0] ?? null); setResult(null); }} /><button className="button secondary" type="button" onClick={() => fileRef.current?.click()}>Choose file</button>{selectedFile && <div className="file-name">Ready to import: {selectedFile.name}</div>}{selectedFile && <button className="button primary import-action" type="button" disabled={busy} onClick={importFile}>{busy ? "Validating…" : "Validate and import"}</button>}{result && <div className={`import-result ${result.type}`} role="status">{result.message}</div>}</div>
         </div>
+      </section>
+    </div>
+  );
+}
+
+function ProjectModal({ tripRecords, onClose, onCreated }: { tripRecords: Trip[]; onClose: () => void; onCreated: () => Promise<void> }) {
+  const [form, setForm] = useState({ id: "", tripId: tripRecords[0]?.id ?? "", areaSqm: "", directCost: "", revenue: "", completionDate: "" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const selectedTrip = tripRecords.find((trip) => trip.id === form.tripId);
+
+  function change(field: keyof typeof form, value: string) {
+    setForm((current) => ({ ...current, [field]: value }));
+  }
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(`${apiUrl}/api/projects`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...form, areaSqm: Number(form.areaSqm), directCost: Number(form.directCost), revenue: Number(form.revenue) }),
+      });
+      const data = await response.json() as { error?: string };
+      if (!response.ok) {
+        setError(data.error ?? "The project could not be created.");
+        return;
+      }
+      await onCreated();
+    } catch {
+      setError("The project service could not be reached.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="modal project-modal" role="dialog" aria-modal="true" aria-labelledby="project-title">
+        <div className="modal-header"><div><h2 id="project-title">Add completed project</h2><p>Create a shed record and connect it to an existing crew trip.</p></div><button className="close-button" type="button" onClick={onClose} aria-label="Close project dialog">×</button></div>
+        <form className="modal-body project-form" onSubmit={submit}>
+          <div className="project-form-grid">
+            <label><span>Shed ID</span><input required value={form.id} onChange={(event) => change("id", event.target.value)} placeholder="QF-04-S01" /></label>
+            <label><span>Trip</span><select required value={form.tripId} onChange={(event) => change("tripId", event.target.value)}>{tripRecords.map((trip) => <option value={trip.id} key={trip.id}>{trip.id} · {trip.farm}</option>)}</select></label>
+            <label><span>Farm</span><input value={selectedTrip?.farm ?? ""} readOnly /></label>
+            <label><span>Completion date</span><input required type="date" value={form.completionDate} onChange={(event) => change("completionDate", event.target.value)} /></label>
+            <label><span>Area (m²)</span><input required min="1" step="0.01" type="number" value={form.areaSqm} onChange={(event) => change("areaSqm", event.target.value)} /></label>
+            <label><span>Direct floor cost (AUD)</span><input required min="0" step="0.01" type="number" value={form.directCost} onChange={(event) => change("directCost", event.target.value)} /></label>
+            <label className="form-span"><span>Contract revenue (AUD)</span><input required min="0" step="0.01" type="number" value={form.revenue} onChange={(event) => change("revenue", event.target.value)} /></label>
+          </div>
+          {error && <p className="login-error" role="alert">{error}</p>}
+          <div className="modal-actions"><button className="button secondary" type="button" onClick={onClose}>Cancel</button><button className="button primary" type="submit" disabled={busy || !tripRecords.length}>{busy ? "Saving…" : "Save project"}</button></div>
+        </form>
       </section>
     </div>
   );
@@ -491,17 +618,18 @@ function formatDate(value: string) {
   return new Intl.DateTimeFormat("en-AU", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`));
 }
 
-function exportReport(records: Shed[], tripRecords: Trip[]) {
-  const header = ["Shed ID", "Farm", "Trip ID", "Area sqm", "Revenue AUD", "Direct Cost AUD", "Allocated Trip Cost AUD", "Total Cost AUD", "Margin AUD", "Margin Percent"];
-  const rows = records.map((shed) => {
-    const economics = shedEconomics(shed, tripRecords);
-    return [shed.id, shed.farm, shed.tripId, shed.areaSqm, shed.revenue, shed.directCost, economics.logistics.toFixed(2), economics.totalCost.toFixed(2), economics.margin.toFixed(2), economics.marginPct.toFixed(2)];
-  });
-  const csv = [header, ...rows].map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(",")).join("\n");
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+async function exportReport(filters: { farm: "All farms" | FarmName; tripId: string; period: string }) {
+  const params = new URLSearchParams();
+  if (filters.farm !== "All farms") params.set("farm", filters.farm);
+  if (filters.tripId !== "All trips") params.set("tripId", filters.tripId);
+  if (filters.period !== "All time") params.set("period", filters.period);
+  const query = params.size ? `?${params.toString()}` : "";
+  const response = await fetch(`${apiUrl}/api/exports/margin-report${query}`, { credentials: "include" });
+  if (!response.ok) throw new Error("Export failed");
+  const url = URL.createObjectURL(await response.blob());
   const link = document.createElement("a");
   link.href = url;
-  link.download = "filokreto-margin-report.csv";
+  link.download = "filokreto-margin-report.xlsx";
   link.click();
   URL.revokeObjectURL(url);
 }

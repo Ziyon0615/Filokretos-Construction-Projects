@@ -23,18 +23,22 @@ test("server-renders the Filokreto login", async () => {
   assert.match(html, /<title>Filokreto \| Cost &amp; Margin Monitor<\/title>/i);
   assert.match(html, /Welcome back/);
   assert.match(html, /Margin Intelligence/);
-  assert.match(html, /Demo workspace access/);
+  assert.match(html, /Authorized users only/);
+  assert.doesNotMatch(html, /Demo workspace access|Demo2026!/);
   assert.doesNotMatch(html, /codex-preview/);
 });
 
-test("starter preview is no longer referenced", async () => {
-  const [page, layout, packageJson] = await Promise.all([
+test("starter preview and implementation details are no longer referenced", async () => {
+  const [page, layout, packageJson, dashboardApp] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../app/dashboard-app.tsx", import.meta.url), "utf8"),
   ]);
   assert.doesNotMatch(page, /_sites-preview|SkeletonPreview|codex-preview/);
   assert.match(page, /DashboardApp/);
   assert.match(layout, /Filokreto/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
+  assert.doesNotMatch(dashboardApp, /Demo workspace access|Local SQLite database|SQLite data|imported into SQLite/);
+  assert.match(dashboardApp, /filokreto-margin-report\.xlsx/);
 });
