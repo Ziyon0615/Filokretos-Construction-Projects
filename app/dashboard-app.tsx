@@ -26,7 +26,7 @@ const views: { label: View; icon: string }[] = [
 
 const sourceTemplates: Record<string, string[]> = {
   "Shed master": ["Shed_ID", "Farm", "Trip_ID", "Area_sqm", "Direct_Floor_Cost", "Contract_Revenue", "Completion_Date"],
-  "Trip log": ["Trip_ID", "Farm", "Start_Date", "End_Date", "Sheds_Completed", "Flight_Cost", "Accommodation", "Food_Allowance", "Vehicle_Cost"],
+  "Trip log": ["Trip_ID", "Farm", "Start_Date", "End_Date", "Sheds_Completed", "Flight_Cost", "Accommodation", "Food_Allowance"],
   "NZ invoices": ["Invoice_ID", "Invoice_Month", "Trip_ID", "Labour_Cost_NZD", "Other_Expenses_NZD", "Total_NZD"],
   "AU Xero costs": ["Date", "Reference_ID", "Trip_ID", "Farm", "Category", "Amount_AUD"],
   "FX rates": ["Month", "NZD_to_AUD_Rate"],

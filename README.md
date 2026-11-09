@@ -57,6 +57,22 @@ Never commit the real Neon URLs or admin password.
 - `npm run lint`: run code-quality checks
 - `npm test`: build and run frontend and backend tests
 
+## Excel imports
+
+Use the **Import source data** action in the dashboard to load the latest
+workbooks. Import the sources in this order:
+
+1. Trip log
+2. Shed master
+3. FX rates
+4. NZ invoices
+5. AU Xero costs
+
+The trip log accepts the current workbook format without `Vehicle_Cost`;
+vehicle costs remain supported when that optional column is present. NZ invoice
+totals are converted to AUD using the matching monthly FX rate, and AU Xero
+costs are included in each trip's allocated cost and margin.
+
 ## Deployment direction
 
 The intended production architecture is:

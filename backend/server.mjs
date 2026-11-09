@@ -16,7 +16,7 @@ const seedDemoData = process.env.SEED_DEMO_DATA === "true";
 
 const importSources = {
   "shed-master": { name: "Shed master", columns: ["Shed_ID", "Farm", "Trip_ID", "Area_sqm", "Direct_Floor_Cost", "Contract_Revenue", "Completion_Date"] },
-  "trip-log": { name: "Trip log", columns: ["Trip_ID", "Farm", "Start_Date", "End_Date", "Sheds_Completed", "Flight_Cost", "Accommodation", "Food_Allowance", "Vehicle_Cost"] },
+  "trip-log": { name: "Trip log", columns: ["Trip_ID", "Farm", "Start_Date", "End_Date", "Sheds_Completed", "Flight_Cost", "Accommodation", "Food_Allowance"] },
   "nz-invoices": { name: "NZ invoices", columns: ["Invoice_ID", "Invoice_Month", "Trip_ID", "Labour_Cost_NZD", "Other_Expenses_NZD", "Total_NZD"] },
   "au-xero-costs": { name: "AU Xero costs", columns: ["Date", "Reference_ID", "Trip_ID", "Farm", "Category", "Amount_AUD"] },
   "fx-rates": { name: "FX rates", columns: ["Month", "NZD_to_AUD_Rate"] },
@@ -332,6 +332,8 @@ async function createMarginReport({ farm, tripId, period }) {
 
 async function importRows(sourceKey, source, filename, rows, user) {
   const batchId = randomUUID();
+  const nzTotalsByTrip = new Map();
+  const auTotalsByTrip = new Map();
   const client = await pool.connect();
   await client.query("BEGIN");
   try {
@@ -341,6 +343,9 @@ async function importRows(sourceKey, source, filename, rows, user) {
         const startDate = requiredDate(record, "Start_Date", rowNumber);
         const endDate = requiredDate(record, "End_Date", rowNumber);
         if (endDate < startDate) throw new ValidationError(`Row ${rowNumber}: End_Date cannot be before Start_Date.`);
+        const vehicleCost = record.Vehicle_Cost === undefined || String(record.Vehicle_Cost).trim() === ""
+          ? 0
+          : requiredNumber(record, "Vehicle_Cost", rowNumber, { nonNegative: true });
         await client.query(`INSERT INTO trips (id, farm, start_date, end_date, batch_size, flight_cost_cents, accommodation_cents, allowance_cents, nz_labour_cents, au_cost_cents)
           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9)
           ON CONFLICT(id) DO UPDATE SET farm=EXCLUDED.farm, start_date=EXCLUDED.start_date, end_date=EXCLUDED.end_date, batch_size=EXCLUDED.batch_size,
@@ -348,7 +353,7 @@ async function importRows(sourceKey, source, filename, rows, user) {
           requiredText(record, "Trip_ID", rowNumber), requiredText(record, "Farm", rowNumber), startDate,
           endDate, requiredNumber(record, "Sheds_Completed", rowNumber, { positive: true, integer: true }),
           Math.round(requiredNumber(record, "Flight_Cost", rowNumber, { nonNegative: true }) * 100), Math.round(requiredNumber(record, "Accommodation", rowNumber, { nonNegative: true }) * 100),
-          Math.round(requiredNumber(record, "Food_Allowance", rowNumber, { nonNegative: true }) * 100), Math.round(requiredNumber(record, "Vehicle_Cost", rowNumber, { nonNegative: true }) * 100),
+          Math.round(requiredNumber(record, "Food_Allowance", rowNumber, { nonNegative: true }) * 100), Math.round(vehicleCost * 100),
         ]);
       }
       if (sourceKey === "shed-master") {
@@ -377,6 +382,13 @@ async function importRows(sourceKey, source, filename, rows, user) {
         const other = requiredNumber(record, "Other_Expenses_NZD", rowNumber, { nonNegative: true });
         const total = requiredNumber(record, "Total_NZD", rowNumber, { nonNegative: true });
         if (Math.abs(labour + other - total) > 0.01) throw new ValidationError(`Row ${rowNumber}: Total_NZD must equal Labour_Cost_NZD plus Other_Expenses_NZD.`);
+        const { rows: fxRows } = await client.query(`SELECT import_rows.data_json->>'NZD_to_AUD_Rate' AS rate
+          FROM import_rows JOIN import_batches ON import_batches.id = import_rows.batch_id
+          WHERE import_batches.source = $1 AND import_rows.data_json->>'Month' = $2
+          ORDER BY import_batches.created_at DESC, import_rows.id DESC LIMIT 1`, [importSources["fx-rates"].name, record.Invoice_Month]);
+        if (!fxRows[0]) throw new ValidationError(`Row ${rowNumber}: No FX rate found for Invoice_Month ${record.Invoice_Month}. Import the FX rates first.`);
+        const convertedTotal = total * Number(fxRows[0].rate);
+        nzTotalsByTrip.set(tripId, (nzTotalsByTrip.get(tripId) ?? 0) + convertedTotal);
       }
       if (sourceKey === "au-xero-costs") {
         requiredDate(record, "Date", rowNumber);
@@ -388,13 +400,20 @@ async function importRows(sourceKey, source, filename, rows, user) {
         const farm = requiredText(record, "Farm", rowNumber);
         if (trip.farm !== farm) throw new ValidationError(`Row ${rowNumber}: Farm must match the selected trip (${trip.farm}).`);
         requiredText(record, "Category", rowNumber);
-        requiredNumber(record, "Amount_AUD", rowNumber, { nonNegative: true });
+        const amount = requiredNumber(record, "Amount_AUD", rowNumber, { nonNegative: true });
+        auTotalsByTrip.set(tripId, (auTotalsByTrip.get(tripId) ?? 0) + amount);
       }
       if (sourceKey === "fx-rates") {
         requiredMonth(record, "Month", rowNumber);
         requiredNumber(record, "NZD_to_AUD_Rate", rowNumber, { positive: true });
       }
       await client.query("INSERT INTO import_rows (batch_id, row_number, data_json) VALUES ($1, $2, $3)", [batchId, rowNumber, JSON.stringify(record)]);
+    }
+    for (const [tripId, total] of nzTotalsByTrip) {
+      await client.query("UPDATE trips SET nz_labour_cents = $1 WHERE id = $2", [Math.round(total * 100), tripId]);
+    }
+    for (const [tripId, total] of auTotalsByTrip) {
+      await client.query("UPDATE trips SET au_cost_cents = $1 WHERE id = $2", [Math.round(total * 100), tripId]);
     }
     await client.query("COMMIT");
     return batchId;
@@ -494,7 +513,7 @@ const server = createServer(async (request, response) => {
       if (!/\.(xlsx|csv)$/i.test(filename)) throw new ValidationError("Only .xlsx and .csv files are accepted.");
       const rows = await parseWorkbook(await readBuffer(request), filename, source);
       const batchId = await importRows(importMatch[1], source, filename, rows, user);
-      return sendJson(response, 201, { batchId, source: source.name, importedRows: rows.length, updatesDashboard: ["trip-log", "shed-master"].includes(importMatch[1]) });
+      return sendJson(response, 201, { batchId, source: source.name, importedRows: rows.length, updatesDashboard: true });
     }
 
     if (request.method === "POST" && url.pathname === "/api/projects") {

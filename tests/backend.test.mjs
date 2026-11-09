@@ -74,7 +74,7 @@ test("PostgreSQL API authenticates users and returns protected dashboard data", 
 
   const sourceHeaders = {
     "shed-master": ["Shed_ID", "Farm", "Trip_ID", "Area_sqm", "Direct_Floor_Cost", "Contract_Revenue", "Completion_Date"],
-    "trip-log": ["Trip_ID", "Farm", "Start_Date", "End_Date", "Sheds_Completed", "Flight_Cost", "Accommodation", "Food_Allowance", "Vehicle_Cost"],
+    "trip-log": ["Trip_ID", "Farm", "Start_Date", "End_Date", "Sheds_Completed", "Flight_Cost", "Accommodation", "Food_Allowance"],
     "nz-invoices": ["Invoice_ID", "Invoice_Month", "Trip_ID", "Labour_Cost_NZD", "Other_Expenses_NZD", "Total_NZD"],
     "au-xero-costs": ["Date", "Reference_ID", "Trip_ID", "Farm", "Category", "Amount_AUD"],
     "fx-rates": ["Month", "NZD_to_AUD_Rate"],
@@ -127,7 +127,7 @@ test("PostgreSQL API authenticates users and returns protected dashboard data", 
       body,
     });
     assert.equal(imported.status, 201);
-    assert.equal((await imported.json()).updatesDashboard, false);
+    assert.equal((await imported.json()).updatesDashboard, true);
   }
 
   const invalidInvoice = await fetch(`${baseUrl}/api/imports/nz-invoices`, {
@@ -150,6 +150,8 @@ test("PostgreSQL API authenticates users and returns protected dashboard data", 
   const data = await dashboard.json();
   assert.equal(data.trips.length, 1);
   assert.equal(data.sheds.length, 2);
+  assert.equal(data.trips[0].nzLabour, 1137.5);
+  assert.equal(data.trips[0].auCost, 325);
 
   const exportResponse = await fetch(`${baseUrl}/api/exports/margin-report?tripId=TEST-01&period=2026`, { headers: { Cookie: cookie, Origin: origin } });
   assert.equal(exportResponse.status, 200);
